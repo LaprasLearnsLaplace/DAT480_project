@@ -11,3 +11,6 @@ basic.*/
 benchmark.*/
 __pycache__/
 *.jstack
+.vscode/
+*.py~
+Project_kernels_HLS/vitis_journal.py
