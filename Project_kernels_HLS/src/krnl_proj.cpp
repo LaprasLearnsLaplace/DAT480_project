@@ -12,12 +12,12 @@ void krnl_proj(
 #pragma HLS INTERFACE s_axilite port = dest bundle = control
 #pragma HLS INTERFACE s_axilite port = return bundle = control
 
-    // 标记下一次读取的字节是否为新的 packet 开始
     static bool start_new_packet = true;
 
 process_loop:
     while (1)
     {
+        #pragma HLS LOOP_FLATTEN off 
 #ifndef __SYNTHESIS__
         if (n2k.empty())
             break;
@@ -28,20 +28,49 @@ process_loop:
 
         ap_uint<DWIDTH> data = v_in.data;
 
+        unsigned char data_buffer[DATA_WIDTH_BYTES];
+        #pragma HLS ARRAY_PARTITION variable=data_buffer complete
+
+    fill_buffer_loop:
+        for (int j = 0; j < DATA_WIDTH_BYTES; ++j) {
+            #pragma HLS UNROLL 
+            data_buffer[j] = data(j * 8 + 7, j * 8);
+        }
+
+        unsigned char next_byte; 
+        unsigned char curr_byte; 
+
+        bool next_reset; 
+        bool curr_reset;
+
     byte_loop:
-        for (int i = 0; i < DATA_WIDTH_BYTES; ++i)
+        for (int i = 0; i < DATA_WIDTH_BYTES + 1; ++i)
         {
-#pragma HLS PIPELINE II=1
+            #pragma HLS PIPELINE II=1
 
-            // 从 512-bit data 中提取第 i 个字节
-            ap_uint<8> tmp = (data >> (8 * i)) & 0xFF;
-            unsigned char in_byte = (unsigned char)tmp;
+            // --- 阶段 A: 预取 (Fetch & Pre-calculate) ---
+            if (i < DATA_WIDTH_BYTES) {
+                // 1. 读数据
+                next_byte = data_buffer[i];
+                
+                // [关键修改] 2. 提前计算 Reset
+                // 我们现在读的是 data_buffer[i]，它将在下一拍被处理。
+                // 所以我们判断当前的 i 是否为 0 即可。
+                // 这个比较操作 (icmp) 现在发生在 Fetch 阶段，不占用 Execute 阶段的时间！
+                next_reset = start_new_packet && (i == 0);
+            }
 
-            // 判断是否为 packet 的第一个字节
-            bool reset = start_new_packet && (i == 0);
+            // --- 阶段 B: 执行 (Execute) ---
+            if (i > 0) {
+                // 现在的 curr_reset 是直接从寄存器出来的
+                // 延迟 ≈ 0ns，不再是 0.8ns！
+                // 这一招直接为你抢回了将近 1ns 的时间。
+                dcam_step(curr_byte, curr_reset, v_in.dest);
+            }
 
-            // DCAM 单字节更新 + 匹配
-            dcam_step(in_byte, reset, v_in.dest);
+            // --- 阶段 C: 移位 (Shift) ---
+            curr_byte = next_byte;
+            curr_reset = next_reset; // 传递 Reset 信号
         }
 
         if (v_in.last)
@@ -53,7 +82,6 @@ process_loop:
             start_new_packet = false;
         }
 
-        // 输出数据包
         k2n.write(v_in);
 
 #ifndef __SYNTHESIS__
