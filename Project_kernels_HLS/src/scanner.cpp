@@ -1,5 +1,5 @@
 #include "scanner.h"
-#include "patterns.h"
+#include "patterns.h" 
 #include <ap_int.h>
 
 void dcam_step(
@@ -9,25 +9,24 @@ void dcam_step(
 {
 #pragma HLS INLINE
 
-    ap_uint<TDWIDTH> current_best = reset ? (ap_uint<TDWIDTH>)0 : dest_signal;
-
+    // 历史记录寄存器
     static ap_uint<PATTERN_MAX_LEN> history[NUM_PATTERNS];
 #pragma HLS ARRAY_PARTITION variable=history complete
 
+    // 当前字节匹配结果
     ap_uint<NUM_PATTERNS> byte_match;
 #pragma HLS ARRAY_PARTITION variable=byte_match complete
     
+    // 1. Decode
 decode_loop:
-    for (int b = 0; b < NUM_PATTERNS; ++b)
-    {
+    for (int b = 0; b < NUM_PATTERNS; ++b) {
 #pragma HLS UNROLL
         byte_match[b] = (in_byte == (unsigned char)b);
     }
 
-
+    // 2. Update History
 update_history:
-    for (int b = 0; b < NUM_PATTERNS; ++b)
-    {
+    for (int b = 0; b < NUM_PATTERNS; ++b) {
 #pragma HLS UNROLL
         ap_uint<PATTERN_MAX_LEN> reg = reset ? (ap_uint<PATTERN_MAX_LEN>)0 : history[b];
         reg <<= 1;
@@ -35,50 +34,47 @@ update_history:
         history[b] = reg;
     }
 
+    // 3. Find Local Best
+    // 初始化为 0xFFFF (代表本周期暂时无匹配)
     ap_uint<TDWIDTH> local_best = (ap_uint<TDWIDTH>)0xFFFF;
-
 
 rule_loop:
     for (int r = 0; r < NUM_PATTERNS; ++r)
     {
 #pragma HLS UNROLL 
+        // 强制 ID 为 16 位常量
+        const ap_uint<TDWIDTH> pattern_id = r + 1; 
+
         int len = rules[r].len;
-        if (len <= 0)
-            continue;
+        if (len <= 0) continue;
 
         bool match = true;
 
-    // 内部字节检查 (并行 AND 树)
+        // 检查规则的所有字节是否满足
     byte_check_loop: 
-        for (int k = 0; k < PATTERN_MAX_LEN; ++k)
-        {
+        for (int k = 0; k < PATTERN_MAX_LEN; ++k) {
 #pragma HLS UNROLL
             if (k < len) {
                 unsigned char pb = rules[r].data[k];
                 unsigned char tap = rules[r].tap_idx[k];
-
                 match &= (history[pb][tap] != 0);
             }
         }
 
-        
-        if (match)
-        {
-            ap_uint<TDWIDTH> pattern_id = (ap_uint<TDWIDTH>)(r + 1);
-            if (pattern_id < local_best)
-            {
+        // 如果当前规则在这一瞬间匹配成功
+        if (match) {
+            // 寻找当前并行匹配到的最小 ID
+            if (pattern_id < local_best) {
                 local_best = pattern_id;
             }
         }
     }
 
-    
-    bool has_match = (local_best != (ap_uint<TDWIDTH>)0xFFFF);
-    
-    bool current_is_zero = (current_best == 0);
-    bool new_is_better = (local_best < current_best);
+    // 4. 输出逻辑 (无闭锁/无状态保持)
+    if (local_best == (ap_uint<TDWIDTH>)0xFFFF) {
+        dest_signal = 0;
+    } else {
+        dest_signal = local_best;
+    }
 
-    bool should_update = has_match && (current_is_zero || new_is_better);
-
-    dest_signal = should_update ? local_best : current_best;
 }

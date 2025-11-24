@@ -38,7 +38,7 @@ NETLAYERDIR = NetLayers/
 CMACDIR     = Ethernet/
 BASICDIR    = Basic_kernels/
 BENCHMARDIR = Benchmark_kernel/
-PROJDIR_HLS = Project_kernels_RTL/
+PROJDIR_HLS = Project_kernels_HLS/
 PROJDIR_RTL = Project_kernels_RTL/
 
 NETLAYERHLS = 100G-fpga-network-stack-core

@@ -28,7 +28,8 @@ extern "C"
   void krnl_proj(
       hls::stream<pkt> &n2k,
       hls::stream<pkt> &k2n,
-      unsigned int dest);
+      unsigned int dest,
+      unsigned int num_packets);
 } // extern "C"
 
 #endif // _KRNL_PROJ_H_
