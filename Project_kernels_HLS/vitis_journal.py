@@ -1,0 +1,31 @@
+#-----------------------------------------------------------------
+# Vitis v2023.1 (64-bit)
+# Start of session at: Thu Nov 20 18:13:50 2025
+# Current directory: /home/m2_1/dat480_project_base/Project_kernels_HLS
+# Command line: vitis -i
+# Journal file: vitis_journal.py
+# Batch mode: $XILINX_VITIS/bin/vitis -new -s /home/m2_1/dat480_project_base/Project_kernels_HLS/vitis_journal.py
+#-----------------------------------------------------------------
+
+#!/usr/bin/env python3
+import vitis
+comp.execute("C_SIMULATION")
+workspace_path = "_x.xilinx_u55c_gen3x16_xdma_3_202210_1/krnl_proj"
+client = vitis.create_client()
+client.set_workspace("_x.xilinx_u55c_gen3x16_xdma_3_202210_1")
+#[Out]# True
+comp = client.get_component("krnl_proj")
+comp.execute("C_SIMULATION")
+comp.execute("C_SIMULATION")
+comp.execute("C_SIMULATION")
+#[Out]# ''
+comp.execute("C_SIMULATION")
+comp.execute("C_SIMULATION")
+comp.execute("C_SIMULATION")
+comp.execute("C_SIMULATION")
+comp.execute("C_SIMULATION")
+#[Out]# ''
+comp.execute("C_SIMULATION")
+#[Out]# ''
+exit()
+vitis.dispose()

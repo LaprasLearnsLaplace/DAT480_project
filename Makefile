@@ -73,6 +73,8 @@ else ifeq (basic,$(DESIGN))
 	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_s2mm.xo
 else ifeq (project,$(DESIGN))
 	LIST_XO += $(PROJDIR_HLS)$(TEMP_DIR)/krnl_proj.xo
+	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_s2mm.xo
+	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_mm2s.xo
 #	LIST_XO += $(PROJDIR_RTL)$(TEMP_DIR)/example.xo # Example of including an RTL kernel, uncomment if needed
 # If you need more kernels, just add them here
 # Either more of your own, or from the basic/benchmark folders

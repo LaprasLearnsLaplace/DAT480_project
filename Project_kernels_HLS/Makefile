@@ -37,10 +37,10 @@ distclean: clean
 
 krnl_proj: $(TEMP_DIR)/krnl_proj.xo
 
-$(TEMP_DIR)/krnl_proj.xo: src/krnl_proj.cpp src/krnl_proj.h krnl_proj.cfg
+$(TEMP_DIR)/krnl_proj.xo: src/krnl_proj.cpp src/krnl_proj.h src/scanner.cpp src/scanner.h src/patterns.h krnl_proj.cfg
 	$(eval kernel := $(subst $(TEMP_DIR)/,,$(subst .xo,,$@)))
 	mkdir -p $(TEMP_DIR)/$(kernel)/$(kernel)
-	$(VPP) --compile --mode hls --work_dir $(TEMP_DIR)/$(kernel)/$(kernel) --config krnl_proj.cfg src/krnl_proj.cpp
+	$(VPP) --compile --mode hls --work_dir $(TEMP_DIR)/$(kernel)/$(kernel) --config krnl_proj.cfg src/krnl_proj.cpp src/scanner.cpp
 	ln -srnf $(TEMP_DIR)/$(kernel)/$(kernel)/$(kernel).xo $@
 
 check-devices:
