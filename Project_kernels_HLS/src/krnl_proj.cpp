@@ -3,13 +3,13 @@
 #include <iostream>
 
 /**
- * @brief 模式匹配内核
- * @param n2k         输入流 (来自网络或上一级)
- * @param k2n         输出流 (发送给 S2MM 写入内存)
- * @param dest        (保留参数) 目的地址或其他配置
- * @param num_packets 控制运行模式:
- *                     0 = 无限循环 (硬件)
- *                     N = 处理完 N 个 packet (TLAST) 后退出 (仿真)
+ * @brief Pattern matching kernel
+ * @param n2k         input stream (from network or upstream)
+ * @param k2n         output stream (to S2MM into memory)
+ * @param dest        reserved parameter (destination/config)
+ * @param num_packets run control:
+ *                     0 = infinite loop (hardware)
+ *                     N = stop after N packets (TLAST) in simulation
  */
 void krnl_proj(
     hls::stream<pkt> &n2k,
@@ -27,7 +27,7 @@ void krnl_proj(
     unsigned int packet_count = 0;
 
 #ifndef __SYNTHESIS__
-    // 仿真保护 避免死循环
+    // Simulation guard to avoid infinite loop
     if (num_packets == 0)
         num_packets = 1;
 #endif
@@ -42,13 +42,13 @@ packet_loop:
         {
         #pragma HLS LOOP_FLATTEN off
 
-            // ========= 1. 读取一个 512-bit beat =========
+            // ========= 1. Read one 512-bit beat =========
             pkt v_in;
             n2k.read(v_in);
 
             ap_uint<DWIDTH> data = v_in.data;
 
-            // 将 512-bit 拆成 64 个 byte
+            // Split 512-bit into 64 bytes
             unsigned char data_buffer[DATA_WIDTH_BYTES];
         #pragma HLS ARRAY_PARTITION variable=data_buffer complete
 
@@ -58,25 +58,25 @@ packet_loop:
                 data_buffer[j] = data(j * 8 + 7, j * 8);
             }
 
-            // ========= 2. 为 64 个字节准备两个 512-bit 输出缓冲 =========
-            ap_uint<512> packer_low  = 0; // 对应 byte 0..31
-            ap_uint<512> packer_high = 0; // 对应 byte 32..63
+            // ========= 2. Prepare two 512-bit output buffers for 64 bytes =========
+            ap_uint<512> packer_low  = 0; // for bytes 0..31
+            ap_uint<512> packer_high = 0; // for bytes 32..63
 
             unsigned char      next_byte = 0;
             unsigned char      curr_byte = 0;
             ap_uint<TDWIDTH>   match_id  = 0;
 
-        // 手动 N+1 pipeline（65 次），第 0 次只预取，不调 dcam
+        // Manual N+1 pipeline (65 iterations); iteration 0 only prefetches
         byte_loop:
             for (int i = 0; i < DATA_WIDTH_BYTES + 1; ++i) {
             #pragma HLS PIPELINE II=1
 
-                // Stage A: 预取下一个字节
+                // Stage A: Prefetch next byte
                 if (i < DATA_WIDTH_BYTES) {
                     next_byte = data_buffer[i];
                 }
 
-                // Stage B: 对上一个字节调用 dcam_step
+                // Stage B: Run dcam_step on previous byte
                 if (i > 0) {
                     int k = i - 1;
                     bool this_reset = start_new_packet && (k == 0);
@@ -91,33 +91,33 @@ packet_loop:
                     }
                 }
 
-                // Stage C: 移位寄存器
+                // Stage C: Shift register
                 curr_byte = next_byte;
             }
 
-            // ========= 3. 写出两个结果 beat =========
+            // ========= 3. Write two result beats =========
             pkt o1, o2;
 
-            // 前 32 个字节的匹配结果
+            // Matches for bytes 0..31
             o1.data = packer_low;
             o1.keep = v_in.keep;
             o1.dest = 0;
-            o1.last = 0;          // 因为后面还有 high 部分
+            o1.last = 0;          // Not last because high part follows
             k2n.write(o1);
 
-            // 后 32 个字节的匹配结果
+            // Matches for bytes 32..63
             o2.data = packer_high;
             o2.keep = v_in.keep;
             o2.dest = 0;
-            o2.last = v_in.last;  // 将输入 TLAST 传递给最后的 high-beat
+            o2.last = v_in.last;  // Propagate TLAST to the final high beat
             k2n.write(o2);
 
-            // ========= 4. packet 结束判断 =========
+            // ========= 4. Packet end check =========
             if (v_in.last) {
-                // 一个 AXI packet 结束
+                // One AXI packet ended
                 break;
             } else {
-                // 同一个 packet 中的后续 beat，start_new_packet 置 0
+                // Subsequent beats of same packet; clear start_new_packet
                 start_new_packet = false;
             }
         } // end beat_loop

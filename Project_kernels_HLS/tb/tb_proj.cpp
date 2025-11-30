@@ -13,7 +13,7 @@ using std::vector;
 using std::string;
 
 // ============================================================================
-//  辅助结构与配置
+//  Helper structures and configuration
 // ============================================================================
 struct MatchResult {
     int byte_index; // 0-63
@@ -21,21 +21,21 @@ struct MatchResult {
 };
 
 // ----------------------------------------------------------------------------
-//  软件参考模型 (Golden Model) 占位（当前未使用）
+//  Software reference model placeholder (currently unused)
 // ----------------------------------------------------------------------------
 void sw_dcam_step(unsigned char in_byte, bool reset, uint16_t &out_id) {
     static uint32_t sw_history[NUM_PATTERNS] = {0};
     (void)in_byte;
     (void)reset;
     (void)out_id;
-    // 这里先不实现，当前 TB 通过构造已知 pattern 来验证硬件行为
+    // Not implemented; TB validates with known patterns
 }
 
 // ============================================================================
-//  流处理辅助函数
+//  Stream helper functions
 // ============================================================================
 
-// 构造输入包
+// Build input packet
 pkt make_pkt(const unsigned char *data, int len, bool last_flag) {
     pkt p;
     p.data = 0;
@@ -48,20 +48,20 @@ pkt make_pkt(const unsigned char *data, int len, bool last_flag) {
     return p;
 }
 
-// 解析输出流 (双倍发包解析：一次消费 2 个 512-bit 输出)
+// Parse output stream (consume two 512-bit outputs per beat)
 vector<MatchResult> drain_one_cycle(hls::stream<pkt> &k2n) {
     vector<MatchResult> res;
     if (k2n.empty()) return res;
 
-    pkt p1 = k2n.read(); // Low 32 bytes 对应 Byte 0-31
-    pkt p2 = k2n.read(); // High 32 bytes 对应 Byte 32-63
+    pkt p1 = k2n.read(); // Low 32 bytes -> Byte 0-31
+    pkt p2 = k2n.read(); // High 32 bytes -> Byte 32-63
 
-    // 解析 P1 (Byte 0-31)
+    // Decode P1 (Byte 0-31)
     for (int i = 0; i < 32; ++i) {
         uint16_t id = (uint16_t)p1.data(i * 16 + 15, i * 16);
         if (id != 0) res.push_back({i, id});
     }
-    // 解析 P2 (Byte 32-63)
+    // Decode P2 (Byte 32-63)
     for (int i = 0; i < 32; ++i) {
         uint16_t id = (uint16_t)p2.data(i * 16 + 15, i * 16);
         if (id != 0) res.push_back({i + 32, id});
@@ -69,7 +69,7 @@ vector<MatchResult> drain_one_cycle(hls::stream<pkt> &k2n) {
     return res;
 }
 
-// 查找规则 ID (Helper)
+// Find rule ID (Helper)
 int get_rule_id(string s) {
     for(int i=0; i<NUM_PATTERNS; ++i) {
         if(rules[i].len != (int)s.size()) continue;
@@ -82,11 +82,11 @@ int get_rule_id(string s) {
 }
 
 // ============================================================================
-//  Test 1: 全零测试 (Silence Test)
+//  Test 1: All-zero (Silence) Test
 // ============================================================================
 bool test_silence() {
     cout << "\n>>> Test 1: Silence (No Match) Test" << endl;
-    unsigned char zero_buf[64] = {0}; // 全 0
+    unsigned char zero_buf[64] = {0}; // all zeros
 
     hls::stream<pkt> n2k("n2k_1");
     hls::stream<pkt> k2n("k2n_1");
@@ -107,7 +107,7 @@ bool test_silence() {
 }
 
 // ============================================================================
-//  Test 2: 边界跨越测试 (Boundary Crossing Byte 31/32)
+//  Test 2: Boundary Crossing (Byte 31/32)
 // ============================================================================
 bool test_boundary_split() {
     cout << "\n>>> Test 2: Boundary Crossing (Byte 31/32)" << endl;
@@ -122,7 +122,7 @@ bool test_boundary_split() {
     unsigned char buf[64];
     for(int i=0; i<64; ++i) buf[i] = ' ';
 
-    int end_pos = 32; // pattern 最后一个字节落在 Byte 32
+    int end_pos = 32; // pattern last byte falls at byte 32
     int start_pos = end_pos - (int)pat.size() + 1;
 
     if(start_pos < 0) {
@@ -160,8 +160,8 @@ bool test_boundary_split() {
 }
 
 // ============================================================================
-//  Test 3A: 随机 Fuzz，多包模式
-//  每个 64B 是一个独立 AXI 包，TLAST 每次为 1，num_packets = N
+//  Test 3A: Random fuzz, multi-packet
+//  Each 64B is a separate AXI packet, TLAST = 1 every time, num_packets = N
 // ============================================================================
 bool test_random_fuzz_multi_packets() {
     cout << "\n>>> Test 3A: Random Fuzzing (Multi-Packet, TLAST every 64B)" << endl;
@@ -170,7 +170,7 @@ bool test_random_fuzz_multi_packets() {
     hls::stream<pkt> n2k("n2k_3A_in");
     hls::stream<pkt> k2n("k2n_3A_out");
 
-    int num_packets = 10; // 10 个独立的 64B 包
+    int num_packets = 10; // 10 independent 64B packets
 
     for(int p=0; p<num_packets; ++p) {
         unsigned char buf[64];
@@ -181,7 +181,7 @@ bool test_random_fuzz_multi_packets() {
         for(int k=0; k<rules[r_idx].len; ++k)
             pat += (char)rules[r_idx].data[k];
         uint16_t expected_id = r_idx + 1;
-        (void)expected_id; // 当前仅做存在性检查，不过度校验
+        (void)expected_id; // Presence check only, not strict verification
 
         if (pat.size() <= 64 && pat.size() > 0) {
             int max_pos  = 64 - (int)pat.size();
@@ -190,12 +190,12 @@ bool test_random_fuzz_multi_packets() {
                 buf[start_pos+i] = pat[i];
         }
 
-        bool is_last = true; // 每个 64B 都是一个独立 packet
+        bool is_last = true; // Each 64B is its own packet
         n2k.write(make_pkt(buf, 64, is_last));
     }
 
     unsigned dummy = 0;
-    unsigned packn = num_packets;   // 告诉 kernel：有 10 个 TLAST 包
+    unsigned packn = num_packets;   // Tell kernel there are 10 TLAST packets
     krnl_proj(n2k, k2n, dummy, packn);
 
     int total_results = 0;
@@ -225,17 +225,17 @@ bool test_random_fuzz_multi_packets() {
 }
 
 // ============================================================================
-//  Test 3B: 随机 Fuzz，单长包模式
-//  多个 64B 拼成一个 AXI 包，只有最后一个 TLAST = 1，num_packets = 1
+//  Test 3B: Random fuzz, single long packet
+//  Multiple 64B beats form one AXI packet; only last beat has TLAST = 1; num_packets = 1
 // ============================================================================
 bool test_random_fuzz_single_long_packet() {
     cout << "\n>>> Test 3B: Random Fuzzing (Single Long Packet, TLAST at end)" << endl;
 
-    srand((unsigned)time(NULL) + 1234); // 换个种子避免和 3A 完全一致
+    srand((unsigned)time(NULL) + 1234); // Different seed to avoid matching 3A
     hls::stream<pkt> n2k("n2k_3B_in");
     hls::stream<pkt> k2n("k2n_3B_out");
 
-    int num_beats   = 10; // 10 个 64B beat 组成一个长包
+    int num_beats   = 10; // 10 beats make one long packet
     int beat_with_last = num_beats - 1;
 
     for(int p=0; p<num_beats; ++p) {
@@ -256,19 +256,19 @@ bool test_random_fuzz_single_long_packet() {
                 buf[start_pos+i] = pat[i];
         }
 
-        bool is_last = (p == beat_with_last); // 只有最后一个 beat TLAST=1
+        bool is_last = (p == beat_with_last); // Only the last beat sets TLAST
         n2k.write(make_pkt(buf, 64, is_last));
     }
 
     unsigned dummy = 0;
-    unsigned packn = 1;   // 告诉 kernel：这是一“个” AXI 包（有多个 beat）
+    unsigned packn = 1;   // Tell kernel this is one AXI packet (multiple beats)
     krnl_proj(n2k, k2n, dummy, packn);
 
     int total_results = 0;
     int beats_read    = 0;
     while(!k2n.empty()) {
         auto res = drain_one_cycle(k2n);
-        beats_read++;   // 每次 drain_one_cycle 对应 1 个 64B beat 的结果
+        beats_read++;   // Each drain_one_cycle corresponds to one 64B beat of output
         if(!res.empty()) {
             if(total_results < 10) {
                 cout << "  [INFO] [3B] Beat " << beats_read

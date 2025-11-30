@@ -5,16 +5,16 @@
 #include "ap_int.h"
 #include "hls_stream.h"
 
-// 数据宽度为 512-bit (64 字节)
+// Data width: 512-bit (64 bytes)
 #define DWIDTH 512
-// 目标 ID 宽度
+// Match ID width
 #define TDWIDTH 16
 
-// 窗口大小 64字节(旧) + 64字节(新)
+// Window size: 64B old + 64B new
 #define DATA_WIDTH_BYTES 64
 #define WINDOW_SIZE (DATA_WIDTH_BYTES * 2)
 
-// 定义我们的数据包类型
+// Packet type definition
 typedef ap_axiu<DWIDTH, 1, 1, TDWIDTH> pkt;
 
 /**

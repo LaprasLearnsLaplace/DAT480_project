@@ -9,11 +9,11 @@ void dcam_step(
 {
 #pragma HLS INLINE
 
-    // 历史记录寄存器
+    // History registers
     static ap_uint<PATTERN_MAX_LEN> history[NUM_PATTERNS];
 #pragma HLS ARRAY_PARTITION variable=history complete
 
-    // 当前字节匹配结果
+    // Per-byte match vector
     ap_uint<NUM_PATTERNS> byte_match;
 #pragma HLS ARRAY_PARTITION variable=byte_match complete
 
@@ -35,14 +35,14 @@ update_history:
     }
 
     // 3. Find Local Best
-    // 初始化为 0xFFFF (代表本周期暂时无匹配)
+    // Init to 0xFFFF (means no match this cycle)
     ap_uint<TDWIDTH> local_best = (ap_uint<TDWIDTH>)0xFFFF;
 
 rule_loop:
     for (int r = 0; r < NUM_PATTERNS; ++r)
     {
 #pragma HLS UNROLL
-        // 强制 ID 为 16 位常量
+        // Force ID to 16-bit constant
         const ap_uint<TDWIDTH> pattern_id = r + 1;
 
         int len = rules[r].len;
@@ -50,7 +50,7 @@ rule_loop:
 
         bool match = true;
 
-        // 检查规则的所有字节是否满足
+        // Check all bytes of the rule
     byte_check_loop:
         for (int k = 0; k < PATTERN_MAX_LEN; ++k) {
 #pragma HLS UNROLL
@@ -61,16 +61,16 @@ rule_loop:
             }
         }
 
-        // 如果当前规则在这一瞬间匹配成功
+        // If this rule matches at this moment
         if (match) {
-            // 寻找当前并行匹配到的最小 ID
+            // Keep the smallest matching ID
             if (pattern_id < local_best) {
                 local_best = pattern_id;
             }
         }
     }
 
-    // 4. 输出逻辑 (无闭锁/无状态保持)
+    // 4. Output logic (stateless)
     if (local_best == (ap_uint<TDWIDTH>)0xFFFF) {
         dest_signal = 0;
     } else {
