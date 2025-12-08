@@ -2,79 +2,102 @@
 #include "patterns.h"
 #include <ap_int.h>
 
-void dcam_step(
-    unsigned char in_byte,
-    bool reset,
-    ap_uint<TDWIDTH> &dest_signal)
+/**
+ * 符合论文架构的多字节 DCAM 实现
+ * 参考: Lecture 3, Slides 29-35 (Sourdis & Pnevmatikatos, FCCM 2004)
+ */
+void dcam_step_multi(
+    unsigned char        in_bytes[DCAM_P],
+    bool                 reset,
+    ap_uint<TDWIDTH>     out_ids[DCAM_P]
+)
 {
-#pragma HLS INLINE
+#pragma HLS INLINE off
+#pragma HLS PIPELINE II=1
 
-    // History registers
-    static ap_uint<PATTERN_MAX_LEN> history[NUM_PATTERNS];
-#pragma HLS ARRAY_PARTITION variable=history complete
+    // ================================================================
+    // STAGE 1: DECODER
+    // ================================================================
+    // one_hot[byte_idx][phase] = 1 当且仅当 in_bytes[phase] == used_bytes[byte_idx]
+    
+    ap_uint<DCAM_P> one_hot[NUM_USED_BYTES];
+#pragma HLS ARRAY_PARTITION variable=one_hot complete
 
-    // Per-byte match vector
-    ap_uint<NUM_PATTERNS> byte_match;
-#pragma HLS ARRAY_PARTITION variable=byte_match complete
-
-    // 1. Decode
-decode_loop:
-    for (int b = 0; b < NUM_PATTERNS; ++b) {
-#pragma HLS UNROLL
-        byte_match[b] = (in_byte == (unsigned char)b);
+decode_stage:
+    for (int b = 0; b < NUM_USED_BYTES; b++) {
+    #pragma HLS UNROLL
+        unsigned char target = used_bytes[b];
+        ap_uint<DCAM_P> match_bits = 0;
+        
+    decode_phases:
+        for (int p = 0; p < DCAM_P; p++) {
+        #pragma HLS UNROLL
+            // in_bytes[0] 最早，存入 bit P-1
+            // in_bytes[P-1] 最晚，存入 bit 0
+            match_bits[DCAM_P - 1 - p] = (in_bytes[p] == target);
+        }
+        one_hot[b] = match_bits;
     }
 
-    // 2. Update History
-update_history:
-    for (int b = 0; b < NUM_PATTERNS; ++b) {
-#pragma HLS UNROLL
-        ap_uint<PATTERN_MAX_LEN> reg = reset ? (ap_uint<PATTERN_MAX_LEN>)0 : history[b];
-        reg <<= 1;
-        reg[0] = byte_match[b];
+    // ================================================================
+    // STAGE 2: SHIFT REGISTER (SRL16)
+    // ================================================================
+    // 共享移位寄存器，每拍左移 P 位
+    
+    static ap_uint<HISTORY_LEN> history[NUM_USED_BYTES];
+#pragma HLS ARRAY_PARTITION variable=history complete
+
+shift_stage:
+    for (int b = 0; b < NUM_USED_BYTES; b++) {
+    #pragma HLS UNROLL
+        ap_uint<HISTORY_LEN> reg;
+        
+        if (reset) {
+            reg = 0;
+        } else {
+            reg = history[b] << DCAM_P;
+        }
+        
+        // 将 one_hot 的 P 位填入低位
+        reg(DCAM_P - 1, 0) = one_hot[b];
+        
         history[b] = reg;
     }
 
-    // 3. Find Local Best
-    // Init to 0xFFFF (means no match this cycle)
-    ap_uint<TDWIDTH> local_best = (ap_uint<TDWIDTH>)0xFFFF;
-
-rule_loop:
-    for (int r = 0; r < NUM_PATTERNS; ++r)
-    {
-#pragma HLS UNROLL
-        // Force ID to 16-bit constant
-        const ap_uint<TDWIDTH> pattern_id = r + 1;
-
-        int len = rules[r].len;
-        if (len <= 0) continue;
-
-        bool match = true;
-
-        // Check all bytes of the rule
-    byte_check_loop:
-        for (int k = 0; k < PATTERN_MAX_LEN; ++k) {
-#pragma HLS UNROLL
-            if (k < len) {
-                unsigned char pb = rules[r].data[k];
-                unsigned char tap = rules[r].tap_idx[k];
-                match &= (history[pb][tap] != 0);
+    // ================================================================
+    // STAGE 3: PATTERN MATCHER
+    // ================================================================
+    // P 个并行匹配器
+    // Tap 公式: tap = (P - 1 - end_pos) + (len - 1 - k)
+    
+match_stage:
+    for (int end_pos = 0; end_pos < DCAM_P; end_pos++) {
+    #pragma HLS UNROLL
+        ap_uint<TDWIDTH> best_match = 0;
+        
+    check_rules:
+        for (int r = 0; r < NUM_PATTERNS; r++) {
+        #pragma HLS UNROLL
+            int len = rules[r].len;
+            if (len <= 0) continue;
+            
+            bool match = true;
+            
+        check_chars:
+            for (int k = 0; k < PATTERN_MAX_LEN; k++) {
+            #pragma HLS UNROLL
+                if (k < len) {
+                    int byte_idx = rules[r].byte_index[k];
+                    int tap = (DCAM_P - 1 - end_pos) + (len - 1 - k);
+                    match &= (bool)history[byte_idx][tap];
+                }
+            }
+            
+            if (match && best_match == 0) {
+                best_match = (ap_uint<TDWIDTH>)(r + 1);
             }
         }
-
-        // If this rule matches at this moment
-        if (match) {
-            // Keep the smallest matching ID
-            if (pattern_id < local_best) {
-                local_best = pattern_id;
-            }
-        }
+        
+        out_ids[end_pos] = best_match;
     }
-
-    // 4. Output logic (stateless)
-    if (local_best == (ap_uint<TDWIDTH>)0xFFFF) {
-        dest_signal = 0;
-    } else {
-        dest_signal = local_best;
-    }
-
 }
