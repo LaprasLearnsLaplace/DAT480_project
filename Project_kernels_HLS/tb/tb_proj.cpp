@@ -3,7 +3,6 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <iomanip>
 #include <cstdlib>
 #include <ctime>
 
@@ -13,71 +12,139 @@ using std::vector;
 using std::string;
 
 // ============================================================================
-//  Helper structures and configuration
+// Sparse output protocol (must match kernel)
 // ============================================================================
 
+static const int EVENT_W     = 128;
+static const int EVENT_BYTES = EVENT_W / 8;          // 16
+static const int KEEP_W      = DATA_WIDTH_BYTES;     // 64
+static const int EVENTS_PER_BEAT = (DWIDTH / EVENT_W); // 512/128 = 4
+
+static const uint8_t EV_FLAG_END      = 1 << 0;
+static const uint8_t EV_FLAG_OVERFLOW = 1 << 1;
+
 struct MatchResult {
-    int      byte_index; // 0 .. DATA_WIDTH_BYTES-1
+    int      byte_index; // packet-local byte index
     uint16_t id;
+    uint8_t  lane;
 };
 
-// 一半宽度：低半区/高半区
-static const int HALF_BYTES = DATA_WIDTH_BYTES / 2;
+struct ReportInfo {
+    uint64_t pkt_in_bytes   = 0;
+    uint64_t pkt_in_beats   = 0;
+    uint64_t pkt_out_bytes  = 0;
+    uint64_t pkt_out_beats  = 0;
+    uint64_t packet_seq     = 0;
+    uint64_t total_in_bytes = 0;
+    uint64_t total_out_bytes= 0;
+};
+
+struct PacketDrainResult {
+    vector<MatchResult> matches;
+    ReportInfo report;
+};
 
 // ----------------------------------------------------------------------------
-//  Software reference model placeholder (currently unused)
+// popcount for 64-bit keep
 // ----------------------------------------------------------------------------
-void sw_dcam_step(unsigned char in_byte, bool reset, uint16_t &out_id) {
-    static uint32_t sw_history[NUM_PATTERNS] = {0};
-    (void)in_byte;
-    (void)reset;
-    (void)out_id;
-    (void)sw_history;
-    // Not implemented; TB validates with known patterns
+static inline int popcount_keep(ap_uint<KEEP_W> k) {
+    int c = 0;
+    for (int i = 0; i < KEEP_W; i++) c += (int)k[i];
+    return c;
+}
+
+// ----------------------------------------------------------------------------
+// unpack one event128 from 512b beat slice
+// event layout (must match kernel):
+// [127:64]  byte_index
+// [63:48]   pattern_id
+// [47:40]   lane
+// [39:32]   flags
+// [31:0]    user/reserved
+// ----------------------------------------------------------------------------
+static inline void unpack_event(
+    const ap_uint<EVENT_W> &w,
+    uint64_t &byte_index,
+    uint16_t &pattern_id,
+    uint8_t  &lane,
+    uint8_t  &flags
+) {
+    byte_index = (uint64_t)w.range(127, 64);
+    pattern_id = (uint16_t)w.range(63, 48);
+    lane       = (uint8_t) w.range(47, 40);
+    flags      = (uint8_t) w.range(39, 32);
 }
 
 // ============================================================================
-//  Stream helper functions
+// Stream helper functions
 // ============================================================================
 
-// Build input packet (64-byte beat)
 pkt make_pkt(const unsigned char *data, int len, bool last_flag) {
     pkt p;
     p.data = 0;
-    p.keep = -1;
+    p.keep = 0;
     p.last = last_flag ? 1 : 0;
-    p.dest = 0;
+    p.dest = 0;      // not used in TB
+    p.user = 0;      // input beats are not report
+    p.id   = 0;
 
-    for (int i = 0; i < len && i < DATA_WIDTH_BYTES; ++i) {
+    int n = (len < DATA_WIDTH_BYTES) ? len : DATA_WIDTH_BYTES;
+    for (int i = 0; i < n; ++i) {
         p.data(i * 8 + 7, i * 8) = data[i];
+        p.keep[i] = 1;
     }
     return p;
 }
 
-// Parse output stream (consume two 512-bit outputs per beat)
-// 低半区：字节 0 .. HALF_BYTES-1
-// 高半区：字节 HALF_BYTES .. DATA_WIDTH_BYTES-1
-vector<MatchResult> drain_one_cycle(hls::stream<pkt> &k2n) {
-    vector<MatchResult> res;
-    if (k2n.empty()) return res;
+// Drain exactly ONE output packet:
+// - EVENT beats have user==0
+// - REPORT beat has user==1 (and should end the packet)
+PacketDrainResult drain_one_packet_sparse(hls::stream<pkt> &k2n) {
+    PacketDrainResult out;
 
-    // Low part: matches for bytes [0, HALF_BYTES-1]
-    pkt p1 = k2n.read();
-    // High part: matches for bytes [HALF_BYTES, DATA_WIDTH_BYTES-1]
-    pkt p2 = k2n.read();
+    while (!k2n.empty()) {
+        pkt w = k2n.read();
+        int valid_bytes = popcount_keep(w.keep);
 
-    // Decode P1
-    for (int i = 0; i < HALF_BYTES; ++i) {
-        uint16_t id = (uint16_t)p1.data(i * 16 + 15, i * 16);
-        if (id != 0) res.push_back({i, id});
+        if (w.user == 0) {
+            // EVENT beat
+            int valid_events = valid_bytes / EVENT_BYTES;
+
+            // Safety: bound events to [0..4]
+            if (valid_events < 0) valid_events = 0;
+            if (valid_events > EVENTS_PER_BEAT) valid_events = EVENTS_PER_BEAT;
+
+            for (int e = 0; e < valid_events; ++e) {
+                ap_uint<EVENT_W> evw = w.data.range((e + 1) * EVENT_W - 1, e * EVENT_W);
+
+                uint64_t byte_index;
+                uint16_t pattern_id;
+                uint8_t  lane;
+                uint8_t  flags;
+
+                unpack_event(evw, byte_index, pattern_id, lane, flags);
+
+                if (flags & EV_FLAG_END) {
+                    continue; // end marker, not a match
+                }
+                if (pattern_id != 0) {
+                    out.matches.push_back({(int)byte_index, pattern_id, lane});
+                }
+            }
+        } else {
+            // REPORT beat (end-of-packet)
+            out.report.pkt_in_bytes    = (uint64_t)w.data.range(63, 0);
+            out.report.pkt_in_beats    = (uint64_t)w.data.range(127, 64);
+            out.report.pkt_out_bytes   = (uint64_t)w.data.range(191, 128);
+            out.report.pkt_out_beats   = (uint64_t)w.data.range(255, 192);
+            out.report.packet_seq      = (uint64_t)w.data.range(319, 256);
+            out.report.total_in_bytes  = (uint64_t)w.data.range(383, 320);
+            out.report.total_out_bytes = (uint64_t)w.data.range(447, 384);
+            return out;
+        }
     }
 
-    // Decode P2
-    for (int i = 0; i < HALF_BYTES; ++i) {
-        uint16_t id = (uint16_t)p2.data(i * 16 + 15, i * 16);
-        if (id != 0) res.push_back({i + HALF_BYTES, id});
-    }
-    return res;
+    return out; // stream ended unexpectedly without REPORT
 }
 
 // Find rule ID (Helper)
@@ -94,7 +161,7 @@ int get_rule_id(string s) {
 }
 
 // ============================================================================
-//  Test 1: All-zero (Silence) Test
+// Test 1: Silence
 // ============================================================================
 
 bool test_silence() {
@@ -111,81 +178,25 @@ bool test_silence() {
     unsigned dummy = 0;
     krnl_proj(n2k, k2n, dummy, 1);
 
-    auto res = drain_one_cycle(k2n);
-    if (res.empty()) {
+    auto out = drain_one_packet_sparse(k2n);
+
+    if (out.matches.empty()) {
         cout << "  [PASS] No false positives detected." << endl;
+        cout << "  [INFO] REPORT: in_bytes=" << out.report.pkt_in_bytes
+             << " out_bytes=" << out.report.pkt_out_bytes
+             << " seq=" << out.report.packet_seq << endl;
         return true;
     } else {
-        cout << "  [FAIL] Detected ID " << res[0].id << " in zero buffer!" << endl;
+        cout << "  [FAIL] Detected ID " << out.matches[0].id
+             << " at byte " << out.matches[0].byte_index << endl;
         return false;
     }
 }
 
-// // ============================================================================
-// //  Test 2: Boundary Crossing (Byte HALF_BYTES-1 / HALF_BYTES)
-// // ============================================================================
-
-// bool test_boundary_split() {
-//     cout << "\n>>> Test 2: Boundary Crossing (Byte "
-//          << (HALF_BYTES - 1) << "/" << HALF_BYTES << ")" << endl;
-
-//     if (NUM_PATTERNS < 1) return true;
-
-//     int      rule_idx  = 0;
-//     uint16_t target_id = rule_idx + 1;
-//     string   pat;
-//     for (int i = 0; i < rules[rule_idx].len; ++i)
-//         pat += (char)rules[rule_idx].data[i];
-
-//     unsigned char buf[DATA_WIDTH_BYTES];
-//     for (int i = 0; i < DATA_WIDTH_BYTES; ++i) buf[i] = ' ';
-
-//     // 让 pattern 的最后一个字节落在 HALF_BYTES 这个位置
-//     int end_pos   = HALF_BYTES;                          // pattern end byte index
-//     int start_pos = end_pos - (int)pat.size() + 1;
-
-//     if (start_pos < 0) {
-//         cout << "  [SKIP] Pattern too long for boundary test." << endl;
-//         return true;
-//     }
-
-//     for (int i = 0; i < (int)pat.size(); ++i) {
-//         buf[start_pos + i] = pat[i];
-//     }
-
-//     hls::stream<pkt> n2k("n2k_2");
-//     hls::stream<pkt> k2n("k2n_2");
-//     n2k.write(make_pkt(buf, DATA_WIDTH_BYTES, true));
-
-//     unsigned dummy = 0;
-//     krnl_proj(n2k, k2n, dummy, 1);
-
-//     auto res   = drain_one_cycle(k2n);
-//     bool found = false;
-
-//     for (auto r : res) {
-//         if (r.id == target_id && r.byte_index == end_pos) {
-//             found = true;
-//             cout << "  [PASS] Found ID " << r.id << " at byte " << r.byte_index
-//                  << " (Crossed boundary " << (HALF_BYTES - 1)
-//                  << "/" << HALF_BYTES << ")" << endl;
-//         }
-//     }
-
-//     if (!found) {
-//         cout << "  [FAIL] Pattern missing at boundary." << endl;
-//         return false;
-//     }
-//     return true;
-// }
-
 // ============================================================================
-//  Test 2: Boundary Crossing (Byte 31/32)
-//  说明：对多相位 DCAM 来说，旧的 1-byte/clk taps 不一定保证跨 31/32
-//  的 pattern 一定被命中，因此这里只做“诊断性测试”：尝试插入 pattern，
-//  打印所有匹配结果，如果在 span 内找到目标 ID 就 PASS；否则给 WARN，
-//  但不让整个 testbench FAIL（避免 csim 直接退出）。
+// Test 2: Boundary diagnostic (Byte 31/32)
 // ============================================================================
+
 bool test_boundary_split() {
     cout << "\n>>> Test 2: Boundary Crossing (Byte 31/32)" << endl;
 
@@ -194,7 +205,6 @@ bool test_boundary_split() {
         return true;
     }
 
-    // 用第 0 条规则做测试
     int      rule_idx  = 0;
     uint16_t target_id = rule_idx + 1;
 
@@ -207,7 +217,6 @@ bool test_boundary_split() {
         return true;
     }
 
-    // 如果 pattern 太长放不下，也跳过
     if ((int)pat.size() > DATA_WIDTH_BYTES) {
         cout << "  [SKIP] Pattern too long for 64B beat." << endl;
         return true;
@@ -216,7 +225,6 @@ bool test_boundary_split() {
     unsigned char buf[DATA_WIDTH_BYTES];
     for (int i = 0; i < DATA_WIDTH_BYTES; ++i) buf[i] = ' ';
 
-    // 让 pattern 最后一个字节“理论上”落在 byte 32
     const int end_pos   = 32;
     const int start_pos = end_pos - (int)pat.size() + 1;
 
@@ -236,20 +244,18 @@ bool test_boundary_split() {
     unsigned dummy = 0;
     krnl_proj(n2k, k2n, dummy, 1);
 
-    auto res = drain_one_cycle(k2n);
+    auto out = drain_one_packet_sparse(k2n);
 
-    if (res.empty()) {
-        cout << "  [WARN] Boundary pattern produced no matches at all "
-             << "(multi-phase DCAM + legacy taps may not guarantee "
-             << "31/32-crossing hits)." << endl;
-        // 不把整个 testbench 判失败，返回 true
+    if (out.matches.empty()) {
+        cout << "  [WARN] No matches reported at all for boundary test." << endl;
         return true;
     }
 
     bool found_in_span = false;
     cout << "  [INFO] Matches reported for boundary test:" << endl;
-    for (auto r : res) {
-        cout << "        ID " << r.id << " at byte " << r.byte_index << endl;
+    for (auto r : out.matches) {
+        cout << "        ID " << r.id << " at byte " << r.byte_index
+             << " lane " << (int)r.lane << endl;
         if (r.id == target_id &&
             r.byte_index >= start_pos &&
             r.byte_index <= end_pos) {
@@ -263,32 +269,25 @@ bool test_boundary_split() {
              << ", " << end_pos << "] crossing 31/32." << endl;
     } else {
         cout << "  [WARN] Target ID " << target_id
-             << " not reported inside span ["
-             << start_pos << ", " << end_pos
-             << "]. This is expected if taps were tuned for a "
-             << "1-byte/clk DCAM and reused in a multi-phase design."
-             << endl;
+             << " not reported inside span [" << start_pos
+             << ", " << end_pos << "]." << endl;
     }
 
-    // 无论如何都让整个 testbench 继续
     return true;
 }
 
-
 // ============================================================================
-//  Test 3A: Random fuzz, multi-packet
-//  Each DATA_WIDTH_BYTES is a separate AXI packet
+// Test 3A: Random fuzz, multi-packet (TLAST every beat)
 // ============================================================================
 
 bool test_random_fuzz_multi_packets() {
-    cout << "\n>>> Test 3A: Random Fuzzing (Multi-Packet, TLAST every beat)"
-         << endl;
+    cout << "\n>>> Test 3A: Random Fuzzing (Multi-Packet, TLAST every beat)" << endl;
 
     srand((unsigned)time(NULL));
     hls::stream<pkt> n2k("n2k_3A_in");
     hls::stream<pkt> k2n("k2n_3A_out");
 
-    int num_packets = 10; // 10 independent packets
+    int num_packets = 10;
 
     for (int p = 0; p < num_packets; ++p) {
         unsigned char buf[DATA_WIDTH_BYTES];
@@ -298,8 +297,6 @@ bool test_random_fuzz_multi_packets() {
         string pat;
         for (int k = 0; k < rules[r_idx].len; ++k)
             pat += (char)rules[r_idx].data[k];
-        uint16_t expected_id = r_idx + 1;
-        (void)expected_id; // Presence check only
 
         if (pat.size() <= DATA_WIDTH_BYTES && pat.size() > 0) {
             int max_pos   = DATA_WIDTH_BYTES - (int)pat.size();
@@ -308,56 +305,56 @@ bool test_random_fuzz_multi_packets() {
                 buf[start_pos + i] = pat[i];
         }
 
-        bool is_last = true; // Each beat is its own packet
-        n2k.write(make_pkt(buf, DATA_WIDTH_BYTES, is_last));
+        n2k.write(make_pkt(buf, DATA_WIDTH_BYTES, true));
     }
 
     unsigned dummy = 0;
     unsigned packn = num_packets;
     krnl_proj(n2k, k2n, dummy, packn);
 
-    int total_results = 0;
     int packets_read  = 0;
+    int total_matches = 0;
 
     while (!k2n.empty()) {
-        auto res = drain_one_cycle(k2n);
+        auto out = drain_one_packet_sparse(k2n);
         packets_read++;
-        if (!res.empty()) {
-            if (total_results < 10) {
-                cout << "  [INFO] [3A] Pkt " << packets_read
-                     << " first match ID " << res[0].id
-                     << " at byte " << res[0].byte_index << endl;
-            }
-            total_results += (int)res.size();
+        total_matches += (int)out.matches.size();
+
+        if (!out.matches.empty() && packets_read <= 10) {
+            cout << "  [INFO] [3A] Pkt " << packets_read
+                 << " first match ID " << out.matches[0].id
+                 << " at byte " << out.matches[0].byte_index
+                 << " lane " << (int)out.matches[0].lane << endl;
         }
+
+        cout << "  [INFO] [3A] REPORT seq=" << out.report.packet_seq
+             << " in_bytes=" << out.report.pkt_in_bytes
+             << " out_bytes=" << out.report.pkt_out_bytes << endl;
     }
 
     if (packets_read == num_packets) {
-        cout << "  [PASS] [3A] Processed " << packets_read
-             << " packets with TLAST per beat." << endl;
+        cout << "  [PASS] [3A] Processed " << packets_read << " packets." << endl;
         return true;
     } else {
-        cout << "  [FAIL] [3A] Output packet count mismatch. Expected "
+        cout << "  [FAIL] [3A] Packet count mismatch. Expected "
              << num_packets << ", got " << packets_read << endl;
         return false;
     }
 }
 
 // ============================================================================
-//  Test 3B: Random fuzz, single long packet
-//  Multiple beats form one AXI packet; TLAST only on last beat
+// Test 3B: Random fuzz, single long packet (TLAST at end)
 // ============================================================================
 
 bool test_random_fuzz_single_long_packet() {
-    cout << "\n>>> Test 3B: Random Fuzzing (Single Long Packet, TLAST at end)"
-         << endl;
+    cout << "\n>>> Test 3B: Random Fuzzing (Single Long Packet, TLAST at end)" << endl;
 
     srand((unsigned)time(NULL) + 1234);
     hls::stream<pkt> n2k("n2k_3B_in");
     hls::stream<pkt> k2n("k2n_3B_out");
 
-    int num_beats       = 10;          // 10 beats make one long packet
-    int beat_with_last  = num_beats-1; // only last beat has TLAST
+    int num_beats      = 10;
+    int beat_with_last = num_beats - 1;
 
     for (int p = 0; p < num_beats; ++p) {
         unsigned char buf[DATA_WIDTH_BYTES];
@@ -367,8 +364,6 @@ bool test_random_fuzz_single_long_packet() {
         string pat;
         for (int k = 0; k < rules[r_idx].len; ++k)
             pat += (char)rules[r_idx].data[k];
-        uint16_t expected_id = r_idx + 1;
-        (void)expected_id;
 
         if (pat.size() <= DATA_WIDTH_BYTES && pat.size() > 0) {
             int max_pos   = DATA_WIDTH_BYTES - (int)pat.size();
@@ -382,53 +377,42 @@ bool test_random_fuzz_single_long_packet() {
     }
 
     unsigned dummy = 0;
-    unsigned packn = 1; // one long AXI packet
-    krnl_proj(n2k, k2n, dummy, packn);
+    krnl_proj(n2k, k2n, dummy, 1);
 
-    int total_results = 0;
-    int beats_read    = 0;
+    auto out = drain_one_packet_sparse(k2n);
 
-    while (!k2n.empty()) {
-        auto res = drain_one_cycle(k2n);
-        beats_read++;
-        if (!res.empty()) {
-            if (total_results < 10) {
-                cout << "  [INFO] [3B] Beat " << beats_read
-                     << " first match ID " << res[0].id
-                     << " at byte " << res[0].byte_index << endl;
-            }
-            total_results += (int)res.size();
-        }
-    }
+    cout << "  [INFO] [3B] REPORT seq=" << out.report.packet_seq
+         << " in_beats=" << out.report.pkt_in_beats
+         << " in_bytes=" << out.report.pkt_in_bytes
+         << " out_bytes=" << out.report.pkt_out_bytes << endl;
 
-    if (beats_read == num_beats) {
-        cout << "  [PASS] [3B] Processed " << beats_read
-             << " beats within a single long packet." << endl;
+    if (out.report.pkt_in_beats == (uint64_t)num_beats) {
+        cout << "  [PASS] [3B] Processed one long packet of "
+             << num_beats << " beats." << endl;
         return true;
     } else {
-        cout << "  [FAIL] [3B] Output beat count mismatch. Expected "
-             << num_beats << ", got " << beats_read << endl;
+        cout << "  [FAIL] [3B] Input beats mismatch. Expected "
+             << num_beats << ", got " << out.report.pkt_in_beats << endl;
         return false;
     }
 }
 
 // ============================================================================
-//  Main
+// Main
 // ============================================================================
 
 int main() {
     cout << "===========================================" << endl;
-    cout << "   Testbench for Multi-phase DCAM Kernel   " << endl;
-    cout << "   DATA_WIDTH_BYTES = " << DATA_WIDTH_BYTES
-         << ", HALF_BYTES = " << HALF_BYTES << endl;
+    cout << "   Testbench for Sparse-Event DCAM Kernel  " << endl;
+    cout << "   DWIDTH = " << DWIDTH << ", DATA_WIDTH_BYTES = " << DATA_WIDTH_BYTES << endl;
     cout << "===========================================" << endl;
 
     bool pass = true;
 
     pass &= test_silence();
     pass &= test_boundary_split();
-    pass &= test_random_fuzz_multi_packets();        // Test 3A
-    pass &= test_random_fuzz_single_long_packet();   // Test 3B
+    pass &= test_random_fuzz_multi_packets();
+    pass &= test_random_fuzz_single_long_packet();
 
     cout << "\n===========================================" << endl;
     if (pass) cout << "   ALL TESTS PASSED " << endl;

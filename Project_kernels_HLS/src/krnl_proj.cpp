@@ -1,125 +1,210 @@
 #include "krnl_proj.h"
 #include "scanner.h"
+#include <ap_int.h>
+#include <hls_stream.h>
 
+// ================================================================
+// Sparse-event output (128-bit/event) packed into 512-bit AXI beats
+// Beat.user == 0 : EVENT beat (0..4 events, keep = n_events*16 bytes)
+// Beat.user == 1 : REPORT beat (always keep = 64B, last = 1)
+// ================================================================
+
+static const int EVENT_W        = 128;
+static const int EVENT_BYTES    = 16;
+static const int SLOTS_PER_BEAT = DWIDTH / EVENT_W; // 4
+
+// Flags
+static const ap_uint<8> EV_FLAG_END      = 1 << 0;
+static const ap_uint<8> EV_FLAG_OVERFLOW = 1 << 1; // reserved (not used here)
+
+// keep mask: lowest n bytes valid
+static inline ap_uint<DATA_WIDTH_BYTES> keep_mask_bytes(int nbytes) {
+#pragma HLS INLINE
+    ap_uint<DATA_WIDTH_BYTES> k = 0;
+    for (int i = 0; i < DATA_WIDTH_BYTES; i++) {
+#pragma HLS UNROLL
+        k[i] = (i < nbytes) ? 1 : 0;
+    }
+    return k;
+}
+
+// pack one 128b event
+static inline ap_uint<EVENT_W> pack_event(
+    ap_uint<64> byte_index,
+    ap_uint<16> pattern_id,
+    ap_uint<8>  lane,
+    ap_uint<8>  flags,
+    ap_uint<32> user_payload = 0
+) {
+#pragma HLS INLINE
+    ap_uint<EVENT_W> w = 0;
+    w.range(127, 64) = byte_index;
+    w.range(63,  48) = pattern_id;
+    w.range(47,  40) = lane;
+    w.range(39,  32) = flags;
+    w.range(31,   0) = user_payload;
+    return w;
+}
+
+extern "C" {
 void krnl_proj(
     hls::stream<pkt> &n2k,
     hls::stream<pkt> &k2n,
     unsigned int dest,
     unsigned int num_packets
-)
-{
+) {
 #pragma HLS INTERFACE axis port = n2k
 #pragma HLS INTERFACE axis port = k2n depth=256
 #pragma HLS INTERFACE s_axilite port = dest        bundle = control
 #pragma HLS INTERFACE s_axilite port = num_packets bundle = control
 #pragma HLS INTERFACE s_axilite port = return      bundle = control
 
-    unsigned int packet_count = 0;
-
-#ifndef __SYNTHESIS__
-    if (num_packets == 0) num_packets = 1;
-#endif
+    // Totals (exclude REPORT)
+    ap_uint<64> total_in_bytes  = 0;
+    ap_uint<64> total_out_bytes = 0;
 
 packet_loop:
-    while ((num_packets == 0) || (packet_count < num_packets))
-    {
-        bool start_new_packet = true;
+    for (unsigned int pkt_idx = 0; pkt_idx < num_packets; ++pkt_idx) {
+        #pragma HLS loop_flatten off
+        ap_uint<64> pkt_in_bytes  = 0;
+        ap_uint<64> pkt_in_beats  = 0;
 
-    beat_loop:
-        while (1)
-        {
-        #pragma HLS LOOP_FLATTEN off
+        // Event payload only (hit events + END event), excludes REPORT
+        ap_uint<64> pkt_out_bytes = 0;
+        ap_uint<64> pkt_out_beats = 0;
 
-            pkt v_in;
-            n2k.read(v_in);
+        bool saw_any_event = false;
 
-            ap_uint<DWIDTH> data = v_in.data;
+    read_beats:
+        while (true) {
+// #pragma HLS PIPELINE II=1
+#pragma HLS loop_flatten off
 
-            // 分割为 64 字节
-            unsigned char data_buffer[DATA_WIDTH_BYTES];
-        #pragma HLS ARRAY_PARTITION variable=data_buffer complete
+            // -------- Read one 64B input beat --------
+            pkt v_in = n2k.read();
+            pkt_in_beats += 1;
 
-        fill_buffer:
-            for (int j = 0; j < DATA_WIDTH_BYTES; ++j) {
-            #pragma HLS UNROLL
-                data_buffer[j] = data(j * 8 + 7, j * 8);
+            // Count valid input bytes via keep
+            ap_uint<DATA_WIDTH_BYTES> kin = v_in.keep;
+            ap_uint<7> in_valid = 0;
+            for (int i = 0; i < DATA_WIDTH_BYTES; i++) {
+#pragma HLS UNROLL
+                in_valid += (ap_uint<1>)kin[i];
             }
+            pkt_in_bytes += in_valid;
 
-            // ============================================
-            // 关键修改：使用临时数组存储结果
-            // ============================================
-            ap_uint<TDWIDTH> match_results[DATA_WIDTH_BYTES];
-        #pragma HLS ARRAY_PARTITION variable=match_results complete
-
-            const int P = DCAM_P;
-
+            // -------- Process this beat in 4B steps --------
+            // Key design choice for timing:
+            // - Do NOT accumulate events across steps (no ev_count chain).
+            // - Each 4B step emits at most ONE EVENT beat with 1..4 events.
         byte_loop:
-            for (int i = 0; i < DATA_WIDTH_BYTES; i += P) {
-            #pragma HLS PIPELINE II=1
+            for (int i = 0; i < DATA_WIDTH_BYTES; i += DCAM_P) {
+#pragma HLS PIPELINE II=1
 
-                unsigned char    in_bytes[P];
-                ap_uint<TDWIDTH> match_ids[P];
-            #pragma HLS ARRAY_PARTITION variable=in_bytes  complete
-            #pragma HLS ARRAY_PARTITION variable=match_ids complete
+                unsigned char in_bytes[DCAM_P];
+#pragma HLS ARRAY_PARTITION variable=in_bytes complete
+                ap_uint<TDWIDTH> out_ids[DCAM_P];
+#pragma HLS ARRAY_PARTITION variable=out_ids complete
 
-            prepare_inputs:
-                for (int p = 0; p < P; ++p) {
-                #pragma HLS UNROLL
-                    in_bytes[p] = data_buffer[i + p];
+                // Load 4 bytes
+                for (int p = 0; p < DCAM_P; p++) {
+#pragma HLS UNROLL
+                    in_bytes[p] = (unsigned char)v_in.data.range((i + p) * 8 + 7, (i + p) * 8);
                 }
 
-                bool reset = start_new_packet && (i == 0);
+                bool reset = (pkt_in_beats == 1) && (i == 0);
+                dcam_step_multi(in_bytes, reset, out_ids);
 
-                dcam_step_multi(in_bytes, reset, match_ids);
+                // Collect hits into local slots (0..3)
+                ap_uint<EVENT_W> ev_local[SLOTS_PER_BEAT];
+#pragma HLS ARRAY_PARTITION variable=ev_local complete
+                ap_uint<3> n_ev = 0;
 
-                // 直接写入临时数组（固定偏移，无 MUX 链）
-            store_results:
-                for (int p = 0; p < P; ++p) {
-                #pragma HLS UNROLL
-                    match_results[i + p] = match_ids[p];
+                for (int p = 0; p < DCAM_P; p++) {
+#pragma HLS UNROLL
+                    ap_uint<TDWIDTH> id = out_ids[p];
+                    if (id != 0) {
+                        ap_uint<64> byte_index =
+                            (ap_uint<64>)((pkt_in_beats - 1) * DATA_WIDTH_BYTES + (i + p));
+                        ev_local[n_ev] = pack_event(byte_index, (ap_uint<16>)id, (ap_uint<8>)p, (ap_uint<8>)0);
+                        n_ev++;
+                    }
+                }
+
+                if (n_ev != 0) {
+                    // Emit ONE event beat containing 1..4 events
+                    pkt o;
+                    o.data = 0;
+                    for (int s = 0; s < SLOTS_PER_BEAT; s++) {
+#pragma HLS UNROLL
+                        if (s < n_ev) {
+                            o.data.range((s + 1) * EVENT_W - 1, s * EVENT_W) = ev_local[s];
+                        }
+                    }
+                    o.keep = keep_mask_bytes((int)n_ev * EVENT_BYTES);
+                    o.dest = 0;
+                    o.user = 0;
+                    o.id   = 0;
+                    o.last = 0;
+                    k2n.write(o);
+
+                    saw_any_event = true;
+                    pkt_out_beats += 1;
+                    pkt_out_bytes += (ap_uint<64>)n_ev * EVENT_BYTES;
                 }
             }
-
-            // ============================================
-            // 打包阶段：完全展开，固定索引
-            // ============================================
-            ap_uint<512> packer_low  = 0;
-            ap_uint<512> packer_high = 0;
-
-        pack_low:
-            for (int k = 0; k < 32; ++k) {
-            #pragma HLS UNROLL
-                packer_low(k * 16 + 15, k * 16) = match_results[k];
-            }
-
-        pack_high:
-            for (int k = 0; k < 32; ++k) {
-            #pragma HLS UNROLL
-                packer_high(k * 16 + 15, k * 16) = match_results[32 + k];
-            }
-
-            // 输出
-            pkt o1, o2;
-
-            o1.data = packer_low;
-            o1.keep = v_in.keep;
-            o1.dest = 0;
-            o1.last = 0;
-            k2n.write(o1);
-
-            o2.data = packer_high;
-            o2.keep = v_in.keep;
-            o2.dest = 0;
-            o2.last = v_in.last;
-            k2n.write(o2);
 
             if (v_in.last) {
-                break;
-            } else {
-                start_new_packet = false;
+                break; // End of input packet
             }
         }
 
-        packet_count++;
+        // If no events at all for the packet, emit a single END marker event
+        if (!saw_any_event) {
+            pkt o;
+            o.data = 0;
+            ap_uint<128> endw = pack_event(/*byte_index*/0, /*pattern_id*/0, /*lane*/0, EV_FLAG_END);
+            o.data.range(127, 0) = endw;
+            o.keep = keep_mask_bytes(EVENT_BYTES);
+            o.dest = 0;
+            o.user = 0;
+            o.id   = 0;
+            o.last = 0;
+            k2n.write(o);
+
+            pkt_out_beats += 1;
+            pkt_out_bytes += EVENT_BYTES;
+        }
+
+        // Update totals (exclude REPORT)
+        total_in_bytes  += pkt_in_bytes;
+        total_out_bytes += pkt_out_bytes;
+
+        // -------- REPORT beat (user=1) --------
+        // Layout matches your current TB:
+        // [63:0]    pkt_in_bytes
+        // [127:64]  pkt_in_beats
+        // [191:128] pkt_out_bytes   (event payload only, excludes REPORT)
+        // [255:192] pkt_out_beats
+        // [319:256] packet_seq
+        // [383:320] total_in_bytes
+        // [447:384] total_out_bytes
+        pkt rep;
+        rep.data = 0;
+        rep.data.range(63,0)     = pkt_in_bytes;
+        rep.data.range(127,64)   = pkt_in_beats;
+        rep.data.range(191,128)  = pkt_out_bytes;
+        rep.data.range(255,192)  = pkt_out_beats;
+        rep.data.range(319,256)  = (ap_uint<64>)pkt_idx;
+        rep.data.range(383,320)  = total_in_bytes;
+        rep.data.range(447,384)  = total_out_bytes;
+
+        rep.keep = (ap_uint<DATA_WIDTH_BYTES>)(~(ap_uint<DATA_WIDTH_BYTES>)0); // 64B valid
+        rep.dest = 0;
+        rep.user = 1;
+        rep.id   = 0;
+        rep.last = 1;
+        k2n.write(rep);
     }
 }
+} // extern "C"
