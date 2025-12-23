@@ -6,8 +6,8 @@ help:
 	@echo "Makefile Usage:"
 	@echo "  make all DEVICE=<FPGA platform> INTERFACE=<CMAC Interface> DESIGN=<design name>"
 	@echo "      Command to generate the xo for specified device and Interface."
-	@echo "      By default, DEVICE=xilinx_u55c_gen3x16_xdma_3_202210_1, INTERFACE=0  DESIGN=benchmark"
-	@echo "      DESIGN also supports the string basic"
+	@echo "      By default, DEVICE=xilinx_u55c_gen3x16_xdma_3_202210_1, INTERFACE=0  DESIGN=basic"
+	@echo "      Supported DESIGN: benchmark, basic, project, benchmark_project"
 	@echo ""
 	@echo "  make clean "
 	@echo "      Command to remove the generated non-hardware files."
@@ -46,44 +46,72 @@ NETLAYERHLS = 100G-fpga-network-stack-core
 POSTSYSLINKTCL ?= $(shell readlink -f ./Ethernet/post_sys_link.tcl)
 SWITCH_IP_FOLDER ?= $(shell readlink -f ./$(BENCHMARDIR)/packaged_kernel_switch_wrapper_$(XSA))
 
-
-LIST_XO = $(NETLAYERDIR)$(TEMP_DIR)/networklayer.xo
+# stream_throughput xo (RTL packaged already)
+THROUGHPUT_XO = Stream_throughput_kernel/build/stream_throughput.xo
 
 CONFIGFLAGS = --config configuration_$(DESIGN)_if$(INTERFACE).tmp.ini
 #CONFIGFLAGS += --kernel_frequency 280
 
-# Include cmac kernel depending on the interface
+# ------------------------------------------------------------
+# Start empty. We add networklayer/cmac only for DESIGN=benchmark
+# ------------------------------------------------------------
+LIST_XO =
+LIST_REPOS =
+
+# helper macro: add cmac for selected interface
+define ADD_CMAC
 ifeq (3,$(INTERFACE))
 	LIST_XO += $(CMACDIR)$(TEMP_DIR)/cmac_0.xo
 	LIST_XO += $(CMACDIR)$(TEMP_DIR)/cmac_1.xo
 else
 	LIST_XO += $(CMACDIR)$(TEMP_DIR)/cmac_$(INTERFACE).xo
 endif
-
-LIST_REPOS = 
+endef
 
 # Include application kernels depending on the design
 ifeq (benchmark,$(DESIGN))
+	# network design
+	LIST_XO += $(NETLAYERDIR)$(TEMP_DIR)/networklayer.xo
+	$(eval $(ADD_CMAC))
 	LIST_XO += $(BENCHMARDIR)$(TEMP_DIR)/traffic_generator.xo
 	LIST_XO += $(BENCHMARDIR)$(TEMP_DIR)/collector.xo
 	LIST_XO += $(BENCHMARDIR)$(TEMP_DIR)/switch_wrapper.xo
 	LIST_REPOS += --user_ip_repo_paths $(SWITCH_IP_FOLDER)
+
 else ifeq (basic,$(DESIGN))
+	# no network
 	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_mm2s.xo
 	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_s2mm.xo
+
 else ifeq (project,$(DESIGN))
+	# no network
 	LIST_XO += $(PROJDIR_HLS)$(TEMP_DIR)/krnl_proj.xo
 	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_s2mm.xo
 	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_mm2s.xo
-#	LIST_XO += $(PROJDIR_RTL)$(TEMP_DIR)/example.xo # Example of including an RTL kernel, uncomment if needed
-# If you need more kernels, just add them here
-# Either more of your own, or from the basic/benchmark folders
+#	LIST_XO += $(PROJDIR_RTL)$(TEMP_DIR)/example.xo # Example RTL kernel
+
+else ifeq (benchmark_project,$(DESIGN))
+	# no network: mm2s -> stream_throughput -> krnl_proj -> s2mm
+	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_mm2s.xo
+	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_s2mm.xo
+	LIST_XO += $(PROJDIR_HLS)$(TEMP_DIR)/krnl_proj.xo
+	LIST_XO += $(THROUGHPUT_XO)
+
+else ifeq (benchmark_project2,$(DESIGN))
+	# no network: mm2s -> stream_throughput -> krnl_proj -> s2mm
+	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_mm2s.xo
+	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_s2mm.xo
+	LIST_XO += $(PROJDIR_HLS)$(TEMP_DIR)/krnl_proj.xo
+	LIST_XO += $(THROUGHPUT_XO)
+
 else
-	$(error DESIGN=$(DESIGN) is not supported! Supported designs are: benchmark, basic, project)
+	$(error DESIGN=$(DESIGN) is not supported! Supported designs are: benchmark, basic, project, benchmark_project)
 endif
 
-# Linker parameters
-# Linker userPostSysLinkTcl param
+
+# ------------------------------------------------------------
+# Linker parameters (keep: needed for post_sys_link.tcl / IP repo)
+# ------------------------------------------------------------
 ifeq (u5,$(findstring u5, $(DEVICE)))
 	HLS_IP_FOLDER  = $(shell readlink -f ./$(NETLAYERDIR)$(NETLAYERHLS)/synthesis_results_HBM)
 else ifeq (u280,$(findstring u280, $(DEVICE)))
@@ -94,8 +122,10 @@ endif
 
 LIST_REPOS += --user_ip_repo_paths $(HLS_IP_FOLDER)
 
+
 .PHONY: all clean distclean distcleanall
 all: check-devices check-vitis check-xrt check-design check-interface create-conf-file $(BINARY_CONTAINERS)
+
 
 # Cleaning stuff
 clean:
@@ -111,11 +141,17 @@ distcleanall: distclean
 	make -C $(BENCHMARDIR) distclean
 
 
-# Building xclbin
+# ------------------------------------------------------------
+# Build xclbin
+# ------------------------------------------------------------
 $(BUILD_DIR)/${XCLBIN_NAME}.xclbin: $(LIST_XO)
 	mkdir -p $(BUILD_DIR)
 	$(VPP) $(CLFLAGS) $(CONFIGFLAGS) --temp_dir $(BUILD_DIR) -l -o'$@' $^ $(LIST_REPOS) -j 8
 
+
+# ------------------------------------------------------------
+# Sub-make rules for producing XO files
+# ------------------------------------------------------------
 $(BASICDIR)$(TEMP_DIR)/%.xo: $(BASICDIR)src/*.cpp
 	make -C $(BASICDIR) all DEVICE=$(DEVICE) -j3
 
@@ -135,26 +171,27 @@ $(PROJDIR_RTL)$(TEMP_DIR)/%.xo: $(PROJDIR_RTL)src/*
 $(PROJDIR_HLS)$(TEMP_DIR)/%.xo: $(PROJDIR_HLS)src/*
 	make -C $(PROJDIR_HLS) all DEVICE=$(DEVICE) -j3
 
+
+# ------------------------------------------------------------
+# Checks
+# ------------------------------------------------------------
 check-devices:
 ifndef DEVICE
 	$(error DEVICE not set. Please set the DEVICE properly and rerun. Run "make help" for more details.)
 endif
 
-#Checks for XILINX_VITIS
 check-vitis:
 ifndef XILINX_VITIS
 	$(error XILINX_VITIS variable is not set, please set correctly and rerun)
 endif
 
-#Checks for XILINX_XRT
 check-xrt:
 ifndef XILINX_XRT
 	$(error XILINX_XRT variable is not set, please set correctly and rerun)
 endif
 
-#Check if the design name is supported
 check-design:
-	@if [[ ($(DESIGN) != "benchmark") && ($(DESIGN) != "basic") && ($(DESIGN) != "project")]]; then\
+	@if [[ ($(DESIGN) != "benchmark") && ($(DESIGN) != "basic") && ($(DESIGN) != "project") && ($(DESIGN) != "benchmark_project") && ($(DESIGN) != "benchmark_project2") ]]; then\
 		echo "DESIGN=$(DESIGN) is not supported!";\
 		exit 1;\
 	fi
@@ -169,7 +206,10 @@ check-interface:
 		exit 1;\
 	fi
 
-#Create configuration file for current design and settings
+
+# ------------------------------------------------------------
+# Create configuration file for current design and settings
+# ------------------------------------------------------------
 create-conf-file:
 	cp config_files/connectivity_$(DESIGN)_if$(INTERFACE).ini configuration_$(DESIGN)_if$(INTERFACE).tmp.ini
 	echo "" >> configuration_$(DESIGN)_if$(INTERFACE).tmp.ini

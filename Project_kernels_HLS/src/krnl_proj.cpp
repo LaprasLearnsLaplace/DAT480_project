@@ -3,21 +3,13 @@
 #include <ap_int.h>
 #include <hls_stream.h>
 
-// ================================================================
-// Sparse-event output (128-bit/event) packed into 512-bit AXI beats
-// Beat.user == 0 : EVENT beat (0..4 events, keep = n_events*16 bytes)
-// Beat.user == 1 : REPORT beat (always keep = 64B, last = 1)
-// ================================================================
-
 static const int EVENT_W        = 128;
 static const int EVENT_BYTES    = 16;
 static const int SLOTS_PER_BEAT = DWIDTH / EVENT_W; // 4
 
-// Flags
 static const ap_uint<8> EV_FLAG_END      = 1 << 0;
-static const ap_uint<8> EV_FLAG_OVERFLOW = 1 << 1; // reserved (not used here)
+static const ap_uint<8> EV_FLAG_OVERFLOW = 1 << 1;
 
-// keep mask: lowest n bytes valid
 static inline ap_uint<DATA_WIDTH_BYTES> keep_mask_bytes(int nbytes) {
 #pragma HLS INLINE
     ap_uint<DATA_WIDTH_BYTES> k = 0;
@@ -28,7 +20,6 @@ static inline ap_uint<DATA_WIDTH_BYTES> keep_mask_bytes(int nbytes) {
     return k;
 }
 
-// pack one 128b event
 static inline ap_uint<EVENT_W> pack_event(
     ap_uint<64> byte_index,
     ap_uint<16> pattern_id,
@@ -46,6 +37,27 @@ static inline ap_uint<EVENT_W> pack_event(
     return w;
 }
 
+static inline pkt build_event_pkt(
+    ap_uint<EVENT_W> evs[SLOTS_PER_BEAT],
+    ap_uint<3>       n_ev
+) {
+#pragma HLS INLINE
+    pkt o;
+    o.data = 0;
+    for (int s = 0; s < SLOTS_PER_BEAT; s++) {
+#pragma HLS UNROLL
+        if (s < n_ev) {
+            o.data.range((s + 1) * EVENT_W - 1, s * EVENT_W) = evs[s];
+        }
+    }
+    o.keep = keep_mask_bytes((int)n_ev * EVENT_BYTES);
+    o.dest = 0;
+    o.user = 0;
+    o.id   = 0;
+    o.last = 0;
+    return o;
+}
+
 extern "C" {
 void krnl_proj(
     hls::stream<pkt> &n2k,
@@ -59,32 +71,27 @@ void krnl_proj(
 #pragma HLS INTERFACE s_axilite port = num_packets bundle = control
 #pragma HLS INTERFACE s_axilite port = return      bundle = control
 
-    // Totals (exclude REPORT)
     ap_uint<64> total_in_bytes  = 0;
     ap_uint<64> total_out_bytes = 0;
 
 packet_loop:
     for (unsigned int pkt_idx = 0; pkt_idx < num_packets; ++pkt_idx) {
-        #pragma HLS loop_flatten off
+#pragma HLS loop_flatten off
+
         ap_uint<64> pkt_in_bytes  = 0;
         ap_uint<64> pkt_in_beats  = 0;
 
-        // Event payload only (hit events + END event), excludes REPORT
         ap_uint<64> pkt_out_bytes = 0;
         ap_uint<64> pkt_out_beats = 0;
 
         bool saw_any_event = false;
 
-    read_beats:
+read_beats:
         while (true) {
-// #pragma HLS PIPELINE II=1
 #pragma HLS loop_flatten off
-
-            // -------- Read one 64B input beat --------
             pkt v_in = n2k.read();
             pkt_in_beats += 1;
 
-            // Count valid input bytes via keep
             ap_uint<DATA_WIDTH_BYTES> kin = v_in.keep;
             ap_uint<7> in_valid = 0;
             for (int i = 0; i < DATA_WIDTH_BYTES; i++) {
@@ -93,11 +100,20 @@ packet_loop:
             }
             pkt_in_bytes += in_valid;
 
-            // -------- Process this beat in 4B steps --------
-            // Key design choice for timing:
-            // - Do NOT accumulate events across steps (no ev_count chain).
-            // - Each 4B step emits at most ONE EVENT beat with 1..4 events.
-        byte_loop:
+            // --------------- 4-bank event stores (one write per bank per cycle) ---------------
+            static const int MAX_EVENTS_PER_LANE = 16; // 64B beat / 4 lanes = 16 steps per lane
+            ap_uint<EVENT_W> evt0[MAX_EVENTS_PER_LANE];
+            ap_uint<EVENT_W> evt1[MAX_EVENTS_PER_LANE];
+            ap_uint<EVENT_W> evt2[MAX_EVENTS_PER_LANE];
+            ap_uint<EVENT_W> evt3[MAX_EVENTS_PER_LANE];
+#pragma HLS BIND_STORAGE variable=evt0 type=ram_1p impl=bram
+#pragma HLS BIND_STORAGE variable=evt1 type=ram_1p impl=bram
+#pragma HLS BIND_STORAGE variable=evt2 type=ram_1p impl=bram
+#pragma HLS BIND_STORAGE variable=evt3 type=ram_1p impl=bram
+
+            ap_uint<5> cnt0 = 0, cnt1 = 0, cnt2 = 0, cnt3 = 0;
+
+byte_loop:
             for (int i = 0; i < DATA_WIDTH_BYTES; i += DCAM_P) {
 #pragma HLS PIPELINE II=1
 
@@ -106,7 +122,6 @@ packet_loop:
                 ap_uint<TDWIDTH> out_ids[DCAM_P];
 #pragma HLS ARRAY_PARTITION variable=out_ids complete
 
-                // Load 4 bytes
                 for (int p = 0; p < DCAM_P; p++) {
 #pragma HLS UNROLL
                     in_bytes[p] = (unsigned char)v_in.data.range((i + p) * 8 + 7, (i + p) * 8);
@@ -115,55 +130,87 @@ packet_loop:
                 bool reset = (pkt_in_beats == 1) && (i == 0);
                 dcam_step_multi(in_bytes, reset, out_ids);
 
-                // Collect hits into local slots (0..3)
-                ap_uint<EVENT_W> ev_local[SLOTS_PER_BEAT];
-#pragma HLS ARRAY_PARTITION variable=ev_local complete
-                ap_uint<3> n_ev = 0;
-
-                for (int p = 0; p < DCAM_P; p++) {
-#pragma HLS UNROLL
-                    ap_uint<TDWIDTH> id = out_ids[p];
-                    if (id != 0) {
-                        ap_uint<64> byte_index =
-                            (ap_uint<64>)((pkt_in_beats - 1) * DATA_WIDTH_BYTES + (i + p));
-                        ev_local[n_ev] = pack_event(byte_index, (ap_uint<16>)id, (ap_uint<8>)p, (ap_uint<8>)0);
-                        n_ev++;
-                    }
+                // One write per lane bank max
+                // lane 0
+                if (out_ids[0] != 0 && cnt0 < MAX_EVENTS_PER_LANE) {
+                    ap_uint<64> byte_index = (ap_uint<64>)((pkt_in_beats - 1) * DATA_WIDTH_BYTES + (i + 0));
+                    evt0[cnt0++] = pack_event(byte_index, (ap_uint<16>)out_ids[0], (ap_uint<8>)0, (ap_uint<8>)0);
                 }
+                // lane 1
+                if (out_ids[1] != 0 && cnt1 < MAX_EVENTS_PER_LANE) {
+                    ap_uint<64> byte_index = (ap_uint<64>)((pkt_in_beats - 1) * DATA_WIDTH_BYTES + (i + 1));
+                    evt1[cnt1++] = pack_event(byte_index, (ap_uint<16>)out_ids[1], (ap_uint<8>)1, (ap_uint<8>)0);
+                }
+                // lane 2
+                if (out_ids[2] != 0 && cnt2 < MAX_EVENTS_PER_LANE) {
+                    ap_uint<64> byte_index = (ap_uint<64>)((pkt_in_beats - 1) * DATA_WIDTH_BYTES + (i + 2));
+                    evt2[cnt2++] = pack_event(byte_index, (ap_uint<16>)out_ids[2], (ap_uint<8>)2, (ap_uint<8>)0);
+                }
+                // lane 3
+                if (out_ids[3] != 0 && cnt3 < MAX_EVENTS_PER_LANE) {
+                    ap_uint<64> byte_index = (ap_uint<64>)((pkt_in_beats - 1) * DATA_WIDTH_BYTES + (i + 3));
+                    evt3[cnt3++] = pack_event(byte_index, (ap_uint<16>)out_ids[3], (ap_uint<8>)3, (ap_uint<8>)0);
+                }
+            }
 
-                if (n_ev != 0) {
-                    // Emit ONE event beat containing 1..4 events
-                    pkt o;
-                    o.data = 0;
-                    for (int s = 0; s < SLOTS_PER_BEAT; s++) {
-#pragma HLS UNROLL
-                        if (s < n_ev) {
-                            o.data.range((s + 1) * EVENT_W - 1, s * EVENT_W) = ev_local[s];
-                        }
-                    }
-                    o.keep = keep_mask_bytes((int)n_ev * EVENT_BYTES);
-                    o.dest = 0;
-                    o.user = 0;
-                    o.id   = 0;
-                    o.last = 0;
+            // --------------- pack + write outside byte_loop ---------------
+            // Merge order (simple + deterministic): lane0 then lane1 then lane2 then lane3
+            // This keeps timing easy. If you must preserve exact byte order, we can do a sorted merge later.
+            ap_uint<EVENT_W> pack_evs[SLOTS_PER_BEAT];
+#pragma HLS ARRAY_PARTITION variable=pack_evs complete
+            ap_uint<3> n_ev = 0;
+
+            auto push_ev = [&](ap_uint<EVENT_W> e) {
+#pragma HLS INLINE
+                pack_evs[n_ev++] = e;
+                if (n_ev == SLOTS_PER_BEAT) {
+                    pkt o = build_event_pkt(pack_evs, n_ev);
                     k2n.write(o);
-
-                    saw_any_event = true;
                     pkt_out_beats += 1;
                     pkt_out_bytes += (ap_uint<64>)n_ev * EVENT_BYTES;
+                    saw_any_event = true;
+                    n_ev = 0;
                 }
+            };
+
+            // lane0
+            for (int j = 0; j < MAX_EVENTS_PER_LANE; j++) {
+#pragma HLS PIPELINE II=1
+                if (j < cnt0) push_ev(evt0[j]);
+            }
+            // lane1
+            for (int j = 0; j < MAX_EVENTS_PER_LANE; j++) {
+#pragma HLS PIPELINE II=1
+                if (j < cnt1) push_ev(evt1[j]);
+            }
+            // lane2
+            for (int j = 0; j < MAX_EVENTS_PER_LANE; j++) {
+#pragma HLS PIPELINE II=1
+                if (j < cnt2) push_ev(evt2[j]);
+            }
+            // lane3
+            for (int j = 0; j < MAX_EVENTS_PER_LANE; j++) {
+#pragma HLS PIPELINE II=1
+                if (j < cnt3) push_ev(evt3[j]);
             }
 
-            if (v_in.last) {
-                break; // End of input packet
+            // flush partial
+            if (n_ev != 0) {
+                pkt o = build_event_pkt(pack_evs, n_ev);
+                k2n.write(o);
+                pkt_out_beats += 1;
+                pkt_out_bytes += (ap_uint<64>)n_ev * EVENT_BYTES;
+                saw_any_event = true;
+                n_ev = 0;
             }
+
+            if (v_in.last) break;
         }
 
-        // If no events at all for the packet, emit a single END marker event
         if (!saw_any_event) {
             pkt o;
             o.data = 0;
-            ap_uint<128> endw = pack_event(/*byte_index*/0, /*pattern_id*/0, /*lane*/0, EV_FLAG_END);
+            ap_uint<128> endw = pack_event(0, 0, 0, EV_FLAG_END);
             o.data.range(127, 0) = endw;
             o.keep = keep_mask_bytes(EVENT_BYTES);
             o.dest = 0;
@@ -176,19 +223,9 @@ packet_loop:
             pkt_out_bytes += EVENT_BYTES;
         }
 
-        // Update totals (exclude REPORT)
         total_in_bytes  += pkt_in_bytes;
         total_out_bytes += pkt_out_bytes;
 
-        // -------- REPORT beat (user=1) --------
-        // Layout matches your current TB:
-        // [63:0]    pkt_in_bytes
-        // [127:64]  pkt_in_beats
-        // [191:128] pkt_out_bytes   (event payload only, excludes REPORT)
-        // [255:192] pkt_out_beats
-        // [319:256] packet_seq
-        // [383:320] total_in_bytes
-        // [447:384] total_out_bytes
         pkt rep;
         rep.data = 0;
         rep.data.range(63,0)     = pkt_in_bytes;
@@ -199,7 +236,7 @@ packet_loop:
         rep.data.range(383,320)  = total_in_bytes;
         rep.data.range(447,384)  = total_out_bytes;
 
-        rep.keep = (ap_uint<DATA_WIDTH_BYTES>)(~(ap_uint<DATA_WIDTH_BYTES>)0); // 64B valid
+        rep.keep = (ap_uint<DATA_WIDTH_BYTES>)(~(ap_uint<DATA_WIDTH_BYTES>)0);
         rep.dest = 0;
         rep.user = 1;
         rep.id   = 0;
