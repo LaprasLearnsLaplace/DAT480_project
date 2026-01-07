@@ -15,3 +15,38 @@ krnl.execute("C_SIMULATION")
 #[Out]# ''
 krnl.execute("SYNTHESIS")
 #[Out]# ''
+krnl.execute("C_SIMULATION")
+#[Out]# ''
+krnl.execute("SYNTHESIS")
+#[Out]# ''
+krnl.execute("C_SIMULATION")
+#[Out]# ''
+krnl.execute("SYNTHESIS")
+krnl.execute("C_SIMULATION")
+#[Out]# ''
+krnl.execute("SYNTHESIS")
+krnl.execute("C_SIMULATION")
+#[Out]# ''
+krnl.execute("SYNTHESIS")
+krnl.execute("C_SIMULATION")
+#[Out]# ''
+krnl.execute("C_SIMULATION")
+#[Out]# ''
+krnl.execute("SYNTHESIS")
+krnl.execute("C_SIMULATION")
+krnl.execute("C_SIMULATION")
+krnl.execute("C_SIMULATION")
+krnl.execute("C_SIMULATION")
+krnl.execute("C_SIMULATION")
+krnl.execute("SYNTHESIS")
+krnl.execute("C_SIMULATION")
+krnl.execute("C_SIMULATION")
+krnl.execute("C_SIMULATION")
+#[Out]# ''
+krnl.execute("C_SIMULATION")
+#[Out]# ''
+krnl.execute("C_SIMULATION")
+#[Out]# ''
+krnl.execute("C_SIMULATION")
+#[Out]# ''
+krnl.execute("SYNTHESIS")

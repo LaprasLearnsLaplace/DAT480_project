@@ -201,48 +201,30 @@ public:
 
     while (pos + EVENT_BYTES <= total_bytes)
     {
-      // 读取128位event
       uint64_t byte_index = 0;
       uint16_t pattern_id = 0;
       uint8_t lane = 0;
 
-      // [63:0] = byte_index
+      // [127:64] = byte_index → bytes [8-15]
       for (int i = 0; i < 8; ++i)
       {
-        byte_index |= ((uint64_t)ddr_buffer[pos + i]) << (i * 8);
+        byte_index |= ((uint64_t)ddr_buffer[pos + 8 + i]) << (i * 8);
       }
 
-      // [79:64] = pattern_id
-      pattern_id = ddr_buffer[pos + 8] | (ddr_buffer[pos + 9] << 8);
+      // [63:48] = pattern_id → bytes [6-7]
+      pattern_id = ddr_buffer[pos + 6] | (ddr_buffer[pos + 7] << 8);
 
-      // [87:80] = lane
-      lane = ddr_buffer[pos + 10];
+      // [47:40] = lane → byte [5]
+      lane = ddr_buffer[pos + 5];
 
-      // 检查是否是有效event
+      // 检查有效性
       if (pattern_id != 0)
       {
         results.push_back({byte_index, pattern_id, lane});
         event_count++;
       }
 
-      // 检查是否是空的end marker (全0且keep=0)
-      bool all_zero = true;
-      for (int i = 0; i < EVENT_BYTES; ++i)
-      {
-        if (ddr_buffer[pos + i] != 0)
-        {
-          all_zero = false;
-          break;
-        }
-      }
-
       pos += EVENT_BYTES;
-
-      // 如果遇到全0的event，可能是padding或end marker
-      if (all_zero && event_count > 0)
-      {
-        // 继续解析，可能后面还有数据
-      }
     }
 
     cout << "  [PARSER] Found " << results.size() << " valid events" << endl;
