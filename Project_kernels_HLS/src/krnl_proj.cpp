@@ -3,62 +3,44 @@
 #include <ap_int.h>
 #include <hls_stream.h>
 
-static const int EVENT_W        = 128;
-static const int EVENT_BYTES    = 16;
-static const int SLOTS_PER_BEAT = DWIDTH / EVENT_W; // 4
+// ============================================================================
+// 优化版本：byte_loop 内不做“动态地址写数组”，改为固定槽位写入 + 事后压缩
+// 目标：让 byte_loop 更容易达到 II=1，并改善时序路径
+// ============================================================================
 
-static const ap_uint<8> EV_FLAG_END      = 1 << 0;
-static const ap_uint<8> EV_FLAG_OVERFLOW = 1 << 1;
+static const int EVENT_W     = 128;
+static const int EVENT_BYTES = EVENT_W / 8;            // 16
+static const int SLOTS_PER_BEAT = DWIDTH / EVENT_W;    // 512/128 = 4
 
-static inline ap_uint<DATA_WIDTH_BYTES> keep_mask_bytes(int nbytes) {
-#pragma HLS INLINE
-    ap_uint<DATA_WIDTH_BYTES> k = 0;
-    for (int i = 0; i < DATA_WIDTH_BYTES; i++) {
-#pragma HLS UNROLL
-        k[i] = (i < nbytes) ? 1 : 0;
-    }
-    return k;
-}
+// 每个 beat 最多 64 bytes -> 最多 64 个事件槽位（按 byte 粒度）
+static const int RAW_SLOTS_PER_BEAT = DATA_WIDTH_BYTES; // 64
+static const int MAX_EVENTS_PER_BEAT = DATA_WIDTH_BYTES; // 64
 
+// Pack event 到 128 位
 static inline ap_uint<EVENT_W> pack_event(
-    ap_uint<64> byte_index,
-    ap_uint<16> pattern_id,
-    ap_uint<8>  lane,
-    ap_uint<8>  flags,
-    ap_uint<32> user_payload = 0
+    uint64_t byte_index,
+    uint16_t pattern_id,
+    uint8_t lane
 ) {
 #pragma HLS INLINE
     ap_uint<EVENT_W> w = 0;
     w.range(127, 64) = byte_index;
-    w.range(63,  48) = pattern_id;
-    w.range(47,  40) = lane;
-    w.range(39,  32) = flags;
-    w.range(31,   0) = user_payload;
+    w.range(63, 48)  = pattern_id;
+    w.range(47, 40)  = lane;
+    // bits [39:0] reserved = 0
     return w;
 }
 
-static inline pkt build_event_pkt(
-    ap_uint<EVENT_W> evs[SLOTS_PER_BEAT],
-    ap_uint<3>       n_ev
-) {
+// Generate keep mask (更小的组合逻辑版本)
+static inline ap_uint<DATA_WIDTH_BYTES> keep_mask_bytes(int num_bytes) {
 #pragma HLS INLINE
-    pkt o;
-    o.data = 0;
-    for (int s = 0; s < SLOTS_PER_BEAT; s++) {
-#pragma HLS UNROLL
-        if (s < n_ev) {
-            o.data.range((s + 1) * EVENT_W - 1, s * EVENT_W) = evs[s];
-        }
-    }
-    o.keep = keep_mask_bytes((int)n_ev * EVENT_BYTES);
-    o.dest = 0;
-    o.user = 0;
-    o.id   = 0;
-    o.last = 0;
-    return o;
+    ap_uint<DATA_WIDTH_BYTES> k = 0;
+    if (num_bytes <= 0) return 0;
+    if (num_bytes >= DATA_WIDTH_BYTES) return ~ap_uint<DATA_WIDTH_BYTES>(0);
+    k = (ap_uint<DATA_WIDTH_BYTES>(1) << num_bytes) - 1;
+    return k;
 }
 
-extern "C" {
 void krnl_proj(
     hls::stream<pkt> &n2k,
     hls::stream<pkt> &k2n,
@@ -66,182 +48,173 @@ void krnl_proj(
     unsigned int num_packets
 ) {
 #pragma HLS INTERFACE axis port = n2k
-#pragma HLS INTERFACE axis port = k2n depth=256
-#pragma HLS INTERFACE s_axilite port = dest        bundle = control
+#pragma HLS INTERFACE axis port = k2n depth=1024
+#pragma HLS INTERFACE s_axilite port = dest bundle = control
 #pragma HLS INTERFACE s_axilite port = num_packets bundle = control
-#pragma HLS INTERFACE s_axilite port = return      bundle = control
+#pragma HLS INTERFACE s_axilite port = return bundle = control
 
-    ap_uint<64> total_in_bytes  = 0;
-    ap_uint<64> total_out_bytes = 0;
+    uint64_t global_byte_idx = 0;
 
+    // =========== MAIN PACKET LOOP ===========
 packet_loop:
-    for (unsigned int pkt_idx = 0; pkt_idx < num_packets; ++pkt_idx) {
-#pragma HLS loop_flatten off
+    for (unsigned pkt_idx = 0; pkt_idx < num_packets; pkt_idx++) {
 
-        ap_uint<64> pkt_in_bytes  = 0;
-        ap_uint<64> pkt_in_beats  = 0;
+        bool first_beat = true;
 
-        ap_uint<64> pkt_out_bytes = 0;
-        ap_uint<64> pkt_out_beats = 0;
-
-        bool saw_any_event = false;
-
+        // =========== READ BEATS LOOP ===========
 read_beats:
         while (true) {
-#pragma HLS loop_flatten off
+#pragma HLS LOOP_TRIPCOUNT min=1 max=22
+
             pkt v_in = n2k.read();
-            pkt_in_beats += 1;
+            bool is_last_input_beat = (v_in.last == 1);
 
-            ap_uint<DATA_WIDTH_BYTES> kin = v_in.keep;
-            ap_uint<7> in_valid = 0;
-            for (int i = 0; i < DATA_WIDTH_BYTES; i++) {
+            // ----------------------------------------------------------------
+            // Phase A: byte_loop 内固定槽位写入 raw_events/raw_valid
+            // ----------------------------------------------------------------
+
+            ap_uint<EVENT_W> raw_events[RAW_SLOTS_PER_BEAT];
+#pragma HLS ARRAY_PARTITION variable=raw_events cyclic factor=4 dim=1
+
+            ap_uint<1> raw_valid[RAW_SLOTS_PER_BEAT];
+#pragma HLS ARRAY_PARTITION variable=raw_valid cyclic factor=4 dim=1
+
+            // 初始化 valid（完全展开，代价很小）
+init_valid:
+            for (int t = 0; t < RAW_SLOTS_PER_BEAT; t++) {
 #pragma HLS UNROLL
-                in_valid += (ap_uint<1>)kin[i];
+                raw_valid[t] = 0;
             }
-            pkt_in_bytes += in_valid;
 
-            // --------------- 4-bank event stores (one write per bank per cycle) ---------------
-            static const int MAX_EVENTS_PER_LANE = 16; // 64B beat / 4 lanes = 16 steps per lane
-            ap_uint<EVENT_W> evt0[MAX_EVENTS_PER_LANE];
-            ap_uint<EVENT_W> evt1[MAX_EVENTS_PER_LANE];
-            ap_uint<EVENT_W> evt2[MAX_EVENTS_PER_LANE];
-            ap_uint<EVENT_W> evt3[MAX_EVENTS_PER_LANE];
-#pragma HLS BIND_STORAGE variable=evt0 type=ram_1p impl=bram
-#pragma HLS BIND_STORAGE variable=evt1 type=ram_1p impl=bram
-#pragma HLS BIND_STORAGE variable=evt2 type=ram_1p impl=bram
-#pragma HLS BIND_STORAGE variable=evt3 type=ram_1p impl=bram
+            // 记录本 beat 的全局 byte 基址，避免在 byte_loop 内更新 global_byte_idx
+            uint64_t base_idx = global_byte_idx;
 
-            ap_uint<5> cnt0 = 0, cnt1 = 0, cnt2 = 0, cnt3 = 0;
-
+            // 处理 64 bytes，每次处理 DCAM_P 个 byte
 byte_loop:
             for (int i = 0; i < DATA_WIDTH_BYTES; i += DCAM_P) {
 #pragma HLS PIPELINE II=1
+#pragma HLS LOOP_TRIPCOUNT min=16 max=16
 
-                unsigned char in_bytes[DCAM_P];
-#pragma HLS ARRAY_PARTITION variable=in_bytes complete
-                ap_uint<TDWIDTH> out_ids[DCAM_P];
-#pragma HLS ARRAY_PARTITION variable=out_ids complete
+                // Extract DCAM_P bytes
+                unsigned char bytes[DCAM_P];
+#pragma HLS ARRAY_PARTITION variable=bytes complete dim=1
 
                 for (int p = 0; p < DCAM_P; p++) {
 #pragma HLS UNROLL
-                    in_bytes[p] = (unsigned char)v_in.data.range((i + p) * 8 + 7, (i + p) * 8);
+                    int byte_offset = i + p;
+                    bytes[p] = (unsigned char)v_in.data.range((byte_offset + 1) * 8 - 1,
+                                                             byte_offset * 8);
                 }
 
-                bool reset = (pkt_in_beats == 1) && (i == 0);
-                dcam_step_multi(in_bytes, reset, out_ids);
+                // DCAM output ids
+                ap_uint<16> out_ids[DCAM_P];
+#pragma HLS ARRAY_PARTITION variable=out_ids complete dim=1
 
-                // One write per lane bank max
-                // lane 0
-                if (out_ids[0] != 0 && cnt0 < MAX_EVENTS_PER_LANE) {
-                    ap_uint<64> byte_index = (ap_uint<64>)((pkt_in_beats - 1) * DATA_WIDTH_BYTES + (i + 0));
-                    evt0[cnt0++] = pack_event(byte_index, (ap_uint<16>)out_ids[0], (ap_uint<8>)0, (ap_uint<8>)0);
-                }
-                // lane 1
-                if (out_ids[1] != 0 && cnt1 < MAX_EVENTS_PER_LANE) {
-                    ap_uint<64> byte_index = (ap_uint<64>)((pkt_in_beats - 1) * DATA_WIDTH_BYTES + (i + 1));
-                    evt1[cnt1++] = pack_event(byte_index, (ap_uint<16>)out_ids[1], (ap_uint<8>)1, (ap_uint<8>)0);
-                }
-                // lane 2
-                if (out_ids[2] != 0 && cnt2 < MAX_EVENTS_PER_LANE) {
-                    ap_uint<64> byte_index = (ap_uint<64>)((pkt_in_beats - 1) * DATA_WIDTH_BYTES + (i + 2));
-                    evt2[cnt2++] = pack_event(byte_index, (ap_uint<16>)out_ids[2], (ap_uint<8>)2, (ap_uint<8>)0);
-                }
-                // lane 3
-                if (out_ids[3] != 0 && cnt3 < MAX_EVENTS_PER_LANE) {
-                    ap_uint<64> byte_index = (ap_uint<64>)((pkt_in_beats - 1) * DATA_WIDTH_BYTES + (i + 3));
-                    evt3[cnt3++] = pack_event(byte_index, (ap_uint<16>)out_ids[3], (ap_uint<8>)3, (ap_uint<8>)0);
+                bool reset = (first_beat && (i == 0));
+                dcam_step_multi(bytes, reset, out_ids);
+
+                // 固定槽位写入：slot = i + p
+                // 这样 HLS 能证明写地址不冲突，byte_loop 更容易 II=1
+                for (int p = 0; p < DCAM_P; p++) {
+#pragma HLS UNROLL
+                    int slot = i + p; // 0..63
+                    if (out_ids[p] != 0) {
+                        raw_events[slot] = pack_event(base_idx + (uint64_t)slot,
+                                                      (uint16_t)out_ids[p],
+                                                      (uint8_t)p);
+                        raw_valid[slot] = 1;
+                    }
                 }
             }
 
-            // --------------- pack + write outside byte_loop ---------------
-            // Merge order (simple + deterministic): lane0 then lane1 then lane2 then lane3
-            // This keeps timing easy. If you must preserve exact byte order, we can do a sorted merge later.
-            ap_uint<EVENT_W> pack_evs[SLOTS_PER_BEAT];
-#pragma HLS ARRAY_PARTITION variable=pack_evs complete
-            ap_uint<3> n_ev = 0;
+            // 一个 input beat 处理完（固定 64 bytes）
+            global_byte_idx += DATA_WIDTH_BYTES;
+            first_beat = false;
 
-            auto push_ev = [&](ap_uint<EVENT_W> e) {
-#pragma HLS INLINE
-                pack_evs[n_ev++] = e;
-                if (n_ev == SLOTS_PER_BEAT) {
-                    pkt o = build_event_pkt(pack_evs, n_ev);
-                    k2n.write(o);
-                    pkt_out_beats += 1;
-                    pkt_out_bytes += (ap_uint<64>)n_ev * EVENT_BYTES;
-                    saw_any_event = true;
-                    n_ev = 0;
-                }
-            };
+            // ----------------------------------------------------------------
+            // Phase B: 压缩 raw_events -> beat_events（连续存储）
+            // ----------------------------------------------------------------
 
-            // lane0
-            for (int j = 0; j < MAX_EVENTS_PER_LANE; j++) {
+            ap_uint<EVENT_W> beat_events[MAX_EVENTS_PER_BEAT];
+#pragma HLS ARRAY_PARTITION variable=beat_events cyclic factor=4 dim=1
+
+            int beat_event_count = 0;
+
+compact_loop:
+            for (int t = 0; t < RAW_SLOTS_PER_BEAT; t++) {
 #pragma HLS PIPELINE II=1
-                if (j < cnt0) push_ev(evt0[j]);
-            }
-            // lane1
-            for (int j = 0; j < MAX_EVENTS_PER_LANE; j++) {
-#pragma HLS PIPELINE II=1
-                if (j < cnt1) push_ev(evt1[j]);
-            }
-            // lane2
-            for (int j = 0; j < MAX_EVENTS_PER_LANE; j++) {
-#pragma HLS PIPELINE II=1
-                if (j < cnt2) push_ev(evt2[j]);
-            }
-            // lane3
-            for (int j = 0; j < MAX_EVENTS_PER_LANE; j++) {
-#pragma HLS PIPELINE II=1
-                if (j < cnt3) push_ev(evt3[j]);
+                if (raw_valid[t]) {
+                    // 每拍最多写一次，地址单调递增，HLS 一般能处理
+                    beat_events[beat_event_count] = raw_events[t];
+                    beat_event_count++;
+                }
             }
 
-            // flush partial
-            if (n_ev != 0) {
-                pkt o = build_event_pkt(pack_evs, n_ev);
+            // ----------------------------------------------------------------
+            // Output loop: 打包输出到 k2n
+            // ----------------------------------------------------------------
+            if (beat_event_count > 0) {
+                int num_output_beats =
+                    (beat_event_count + SLOTS_PER_BEAT - 1) / SLOTS_PER_BEAT;
+
+output_loop:
+            for (int ob = 0; ob < num_output_beats; ob++) {
+            #pragma HLS PIPELINE II=1
+            #pragma HLS LOOP_TRIPCOUNT min=1 max=16
+
+                pkt o;
+                o.data = 0;
+                o.dest = dest;
+                o.user = 0;
+                o.id   = 0;
+                o.last = 0;
+
+                // 计算本 beat 需要输出几个 event：n = clamp(beat_event_count - ob*4, 0..4)
+                int base = ob * SLOTS_PER_BEAT;              // SLOTS_PER_BEAT=4
+                int left = beat_event_count - base;
+
+                ap_uint<3> n;                                // 0..4 fits in 3 bits
+                if (left <= 0)      n = 0;
+                else if (left >= 4) n = 4;
+                else                n = (ap_uint<3>)left;
+
+                // Pack events：仍然 UNROLL，但不再有 events_in_this_beat++ 链
+                for (int s = 0; s < SLOTS_PER_BEAT; s++) {
+            #pragma HLS UNROLL
+                    int ev_idx = base + s;
+                    if (ev_idx < beat_event_count) {
+                        o.data.range((s + 1) * EVENT_W - 1, s * EVENT_W) = beat_events[ev_idx];
+                    }
+                }
+
+                // keep 用 switch 常量表（最短组合逻辑），避免 variable shift/加法链
+                // EVENT_BYTES=16, 所以 num_bytes = n*16: 0,16,32,48,64
+                switch ((int)n) {
+                    case 0: o.keep = 0x0000000000000000ULL; break;
+                    case 1: o.keep = 0x000000000000FFFFULL; break;
+                    case 2: o.keep = 0x00000000FFFFFFFFULL; break;
+                    case 3: o.keep = 0x0000FFFFFFFFFFFFULL; break;
+                    default:o.keep = 0xFFFFFFFFFFFFFFFFULL; break; // 4
+                }
+
                 k2n.write(o);
-                pkt_out_beats += 1;
-                pkt_out_bytes += (ap_uint<64>)n_ev * EVENT_BYTES;
-                saw_any_event = true;
-                n_ev = 0;
             }
 
-            if (v_in.last) break;
+            }
+
+            if (is_last_input_beat) break;
         }
 
-        if (!saw_any_event) {
-            pkt o;
-            o.data = 0;
-            ap_uint<128> endw = pack_event(0, 0, 0, EV_FLAG_END);
-            o.data.range(127, 0) = endw;
-            o.keep = keep_mask_bytes(EVENT_BYTES);
-            o.dest = 0;
-            o.user = 0;
-            o.id   = 0;
-            o.last = 0;
-            k2n.write(o);
-
-            pkt_out_beats += 1;
-            pkt_out_bytes += EVENT_BYTES;
-        }
-
-        total_in_bytes  += pkt_in_bytes;
-        total_out_bytes += pkt_out_bytes;
-
-        pkt rep;
-        rep.data = 0;
-        rep.data.range(63,0)     = pkt_in_bytes;
-        rep.data.range(127,64)   = pkt_in_beats;
-        rep.data.range(191,128)  = pkt_out_bytes;
-        rep.data.range(255,192)  = pkt_out_beats;
-        rep.data.range(319,256)  = (ap_uint<64>)pkt_idx;
-        rep.data.range(383,320)  = total_in_bytes;
-        rep.data.range(447,384)  = total_out_bytes;
-
-        rep.keep = (ap_uint<DATA_WIDTH_BYTES>)(~(ap_uint<DATA_WIDTH_BYTES>)0);
-        rep.dest = 0;
-        rep.user = 1;
-        rep.id   = 0;
-        rep.last = 1;
-        k2n.write(rep);
+        // =========== FINALIZE PACKET ===========
+        // 更 AXIS 友好：last beat 至少 1 byte 有效（避免 keep=0 的兼容性坑）
+        pkt end_marker;
+        end_marker.data = 0;
+        end_marker.data.range(7, 0) = 0xEE;        // tag byte (可选)
+        end_marker.keep = keep_mask_bytes(1);      // 1 byte valid
+        end_marker.dest = dest;
+        end_marker.user = 0;
+        end_marker.id   = 0;
+        end_marker.last = 1;
+        k2n.write(end_marker);
     }
 }
-} // extern "C"

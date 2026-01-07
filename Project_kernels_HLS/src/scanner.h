@@ -7,18 +7,20 @@
 
 // 多字节处理并行度
 #ifndef DCAM_P
-#define DCAM_P 4
+#define DCAM_P 8
 #endif
 
-// History 长度：PATTERN_MAX_LEN + DCAM_P - 1，向上取整
-#define HISTORY_LEN 32
+// History长度：使用patterns.h中计算的值
+#ifndef HISTORY_LEN
+#define HISTORY_LEN HISTORY_BITS
+#endif
 
 /**
- * @brief 符合论文架构的多字节 DCAM
+ * @brief DCAM多字节匹配器
  * 
- * @param in_bytes  输入的 P 个字节 [0]=最早, [P-1]=最晚
- * @param reset     复位信号（新 packet 开始时为 true）
- * @param out_ids   输出的 P 个匹配 ID (0=无匹配)
+ * @param in_bytes  输入P个字节 [0]=最早, [P-1]=最晚
+ * @param reset     复位信号（新packet开始时为true）
+ * @param out_ids   输出P个匹配ID (0=无匹配)
  */
 void dcam_step_multi(
     unsigned char        in_bytes[DCAM_P],
