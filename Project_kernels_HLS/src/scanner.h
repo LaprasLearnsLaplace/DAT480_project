@@ -5,14 +5,27 @@
 #include "patterns.h"
 #include <ap_int.h>
 
-#define DCAM_P 4             // 并行处理8个bytes
-#define NUM_BANKS 4          // 4个bank
-#define PATTERNS_PER_BANK 64 // 每个bank 64个patterns
-#define HISTORY_BITS 16      // History寄存器深度
+// 多字节处理并行度
+#ifndef DCAM_P
+#define DCAM_P 8
+#endif
 
+// History长度：使用patterns.h中计算的值
+#ifndef HISTORY_LEN
+#define HISTORY_LEN HISTORY_BITS
+#endif
+
+/**
+ * @brief DCAM多字节匹配器
+ * 
+ * @param in_bytes  输入P个字节 [0]=最早, [P-1]=最晚
+ * @param reset     复位信号（新packet开始时为true）
+ * @param out_ids   输出P个匹配ID (0=无匹配)
+ */
 void dcam_step_multi(
-    unsigned char bytes[DCAM_P],
-    bool reset,
-    ap_uint<16> out_ids[DCAM_P]);
+    unsigned char        in_bytes[DCAM_P],
+    bool                 reset,
+    ap_uint<TDWIDTH>     out_ids[DCAM_P]
+);
 
 #endif // SCANNER_H
