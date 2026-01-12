@@ -9,3 +9,14 @@ k.execute("SYNTHESIS")
 #[Out]# ''
 k.execute("SYNTHESIS")
 #[Out]# ''
+k.execute("SYNTHESIS")
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
