@@ -7,7 +7,7 @@
 
 // 多字节处理并行度
 #ifndef DCAM_P
-#define DCAM_P 1
+#define DCAM_P 2
 #endif
 
 // History长度：使用patterns.h中计算的值

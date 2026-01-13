@@ -13,3 +13,50 @@ k.execute("C_SIMULATION")
 #[Out]# ''
 k.execute("SYNTHESIS")
 #[Out]# ''
+k.execute("C_SIMULATION")
+k.execute("C_SIMULATION")
+k.execute("C_SIMULATION")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("C_SIMULATION")
+k.execute("C_SIMULATION")
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("SYNTHESIS")
+k.execute("SYNTHESIS")
+k.execute("C_SIMULATION")
+k.execute("C_SIMULATION")
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("C_SIMULATION")
+#[Out]# ''
+k.execute("SYNTHESIS")
+k.execute("SYNTHESIS")
+k.execute("SYNTHESIS")
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("C_SIMULATION")
+#[Out]# ''
+k.execute("C_SIMULATION")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''
+k.execute("C_SIMULATION")
+#[Out]# ''
+k.execute("SYNTHESIS")
+#[Out]# ''

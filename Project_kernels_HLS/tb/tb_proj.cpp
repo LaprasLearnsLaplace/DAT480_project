@@ -216,7 +216,7 @@ static vector<MatchResult> parse_events(const unsigned char *ddr_buffer, int tot
         }
 
         // 判定有效性：如果 pattern_id 不为 0，则视为有效事件
-        if (pattern_id != 0)
+        if (pattern_id != 0 && pattern_id != 0xEE) // 重点：排除 0xEE 标记
         {
             results.push_back({byte_index, pattern_id, lane});
         }
