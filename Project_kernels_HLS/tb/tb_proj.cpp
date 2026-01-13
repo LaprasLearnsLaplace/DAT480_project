@@ -190,65 +190,41 @@ public:
 class EventParser
 {
 public:
-  static vector<MatchResult> parse_events(const unsigned char *ddr_buffer, int total_bytes)
-  {
+static vector<MatchResult> parse_events(const unsigned char *ddr_buffer, int total_bytes)
+{
     vector<MatchResult> results;
-
-    cout << "  [PARSER] Parsing " << total_bytes << " bytes from DDR" << endl;
-
     int pos = 0;
-    int event_count = 0;
 
     while (pos + EVENT_BYTES <= total_bytes)
     {
-      // 读取128位event
-      uint64_t byte_index = 0;
-      uint16_t pattern_id = 0;
-      uint8_t lane = 0;
+        uint64_t byte_index = 0;
+        uint16_t pattern_id = 0;
+        uint8_t lane = 0;
 
-      // [63:0] = byte_index
-      for (int i = 0; i < 8; ++i)
-      {
-        byte_index |= ((uint64_t)ddr_buffer[pos + i]) << (i * 8);
-      }
+        // --- 核心修改点：根据内核 range() 对齐偏移量 ---
 
-      // [79:64] = pattern_id
-      pattern_id = ddr_buffer[pos + 8] | (ddr_buffer[pos + 9] << 8);
+        // 1. lane 在 [47:40]，对应字节索引 5
+        lane = ddr_buffer[pos + 5];
 
-      // [87:80] = lane
-      lane = ddr_buffer[pos + 10];
+        // 2. pattern_id 在 [63:48]，对应字节索引 6 和 7 (小端)
+        pattern_id = ddr_buffer[pos + 6] | (ddr_buffer[pos + 7] << 8);
 
-      // 检查是否是有效event
-      if (pattern_id != 0)
-      {
-        results.push_back({byte_index, pattern_id, lane});
-        event_count++;
-      }
-
-      // 检查是否是空的end marker (全0且keep=0)
-      bool all_zero = true;
-      for (int i = 0; i < EVENT_BYTES; ++i)
-      {
-        if (ddr_buffer[pos + i] != 0)
+        // 3. byte_index 在 [127:64]，对应字节索引 8 到 15
+        for (int i = 0; i < 8; ++i)
         {
-          all_zero = false;
-          break;
+            byte_index |= ((uint64_t)ddr_buffer[pos + 8 + i]) << (i * 8);
         }
-      }
 
-      pos += EVENT_BYTES;
+        // 判定有效性：如果 pattern_id 不为 0，则视为有效事件
+        if (pattern_id != 0)
+        {
+            results.push_back({byte_index, pattern_id, lane});
+        }
 
-      // 如果遇到全0的event，可能是padding或end marker
-      if (all_zero && event_count > 0)
-      {
-        // 继续解析，可能后面还有数据
-      }
+        pos += EVENT_BYTES; // 移动到下一个 128-bit (16字节) block
     }
-
-    cout << "  [PARSER] Found " << results.size() << " valid events" << endl;
-
     return results;
-  }
+}
 
   static void print_events(const vector<MatchResult> &events, int max_print = 10)
   {
