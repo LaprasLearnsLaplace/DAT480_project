@@ -44,9 +44,12 @@ def collect_used_bytes(patterns):
             used.add(b)
     return sorted(list(used))
 
-def generate_patterns_h(patterns, output_file, max_len=16, dcam_p=4):
+def generate_patterns_h(patterns, output_file, dcam_p=2):
     used_bytes = collect_used_bytes(patterns)
     byte_to_index = {b: i for i, b in enumerate(used_bytes)}
+    
+    # 直接用真实的最大长度
+    max_len = max(len(p['bytes']) for p in patterns)
     
     # 计算需要的history长度
     max_pattern_len = max(len(p['bytes']) for p in patterns)

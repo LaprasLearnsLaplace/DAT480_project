@@ -61,5 +61,6 @@
     "thread": "cpp",
     "typeinfo": "cpp"
 },
-"clangd.fallbackFlags": []
+"clangd.fallbackFlags": [],
+"cmake.sourceDirectory": "/home/m2_1/dat480_project_base/xrt_host_api"
 }

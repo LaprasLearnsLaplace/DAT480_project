@@ -88,7 +88,8 @@ else ifeq (project,$(DESIGN))
 	LIST_XO += $(PROJDIR_HLS)$(TEMP_DIR)/krnl_proj.xo
 	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_s2mm.xo
 	LIST_XO += $(BASICDIR)$(TEMP_DIR)/krnl_mm2s.xo
-#	LIST_XO += $(PROJDIR_RTL)$(TEMP_DIR)/example.xo # Example RTL kernel
+	LIST_XO += $(NETLAYERDIR)$(TEMP_DIR)/networklayer.xo
+	LIST_XO += $(CMACDIR)$(TEMP_DIR)/cmac_0.xo
 
 else ifeq (benchmark_project,$(DESIGN))
 	# no network: mm2s -> stream_throughput -> krnl_proj -> s2mm
